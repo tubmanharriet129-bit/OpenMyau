@@ -279,6 +279,44 @@ public class BackTrack extends Module {
         // All other inbound: untouched
     }
 
+    // ── KillAura sync API ─────────────────────────────────────────────────
+
+    /**
+     * Called by KillAura when its burst of 8 hits completes and the pause begins.
+     * Flush the buffer immediately so the enemy snaps to their real position
+     * during the pause window — KillAura's first hit after the pause lands
+     * at the freshly updated real position.
+     */
+    public void onKillAuraBurstComplete() {
+        if (!this.isEnabled() || !this.engaged) return;
+        this.drainAndProcess(this.targetId);
+        // Do NOT rearm — let the enemy stay at real position during pause
+    }
+
+    /**
+     * Called by KillAura when its pause ends and the next burst is about to start.
+     * Rearm the buffer so the burst fires at a frozen position again.
+     */
+    public void onKillAuraResuming() {
+        if (!this.isEnabled() || !this.engaged) return;
+        this.bufferStart = System.currentTimeMillis();
+    }
+
+    /**
+     * Called by KillAura when it switches to a new target.
+     * Flush the old target's buffer and sync to the new entity ID.
+     */
+    public void syncTarget(int entityId) {
+        if (!this.isEnabled()) return;
+        if (this.targetId != -1 && this.targetId != entityId) {
+            this.flushAll();
+        }
+        this.targetId     = entityId;
+        this.engaged      = true;
+        this.bufferStart  = System.currentTimeMillis();
+        this.prevYTracked = false;
+    }
+
     // ── Attack detection — arm on first outbound C02 attack ──────────────
 
     private void handleOutboundAttack(Packet<?> packet) {
