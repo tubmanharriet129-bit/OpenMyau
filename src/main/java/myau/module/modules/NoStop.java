@@ -29,6 +29,7 @@ public class NoStop extends Module {
      */
     private volatile boolean hitLanded  = false;
     private volatile boolean tookDamage = false;
+    private volatile long    armedAt    = -1L;
 
     // -------------------------------------------------------
     // Properties
@@ -39,6 +40,14 @@ public class NoStop extends Module {
      * When ON  — restores sprint when YOU take damage instead.
      */
     public final BooleanProperty onDamage;
+
+    /**
+     * How long to wait after the trigger before restoring sprint.
+     * 0 = restore immediately on the very next movement tick.
+     * With on-damage ON: waits this long after taking damage.
+     * With on-damage OFF: waits this long after dealing damage.
+     */
+    public final myau.property.properties.IntProperty delay;
 
     /**
      * When enabled, only activates while holding a sword.
@@ -52,6 +61,7 @@ public class NoStop extends Module {
     public NoStop() {
         super("NoStop", false);
         this.onDamage   = new BooleanProperty("on-damage", false);
+        this.delay      = new myau.property.properties.IntProperty("delay", 0, 0, 500);
         this.weaponOnly = new BooleanProperty("weapon-only", true);
     }
 
@@ -83,15 +93,25 @@ public class NoStop extends Module {
 
         boolean shouldRestore = this.onDamage.getValue() ? this.tookDamage : this.hitLanded;
         if (!shouldRestore || !this.canActivate()) {
-            this.hitLanded  = false;
-            this.tookDamage = false;
+            if (!shouldRestore) {
+                this.hitLanded  = false;
+                this.tookDamage = false;
+                this.armedAt    = -1L;
+            }
             return;
         }
+
+        // Arm the timer on the first tick the condition is met
+        if (this.armedAt < 0L) this.armedAt = System.currentTimeMillis();
+
+        // Wait for delay to elapse before restoring sprint
+        if (System.currentTimeMillis() - this.armedAt < this.delay.getValue()) return;
 
         // Only restore — never cancel. The game cancelled it already.
         mc.thePlayer.setSprinting(true);
         this.hitLanded  = false;
         this.tookDamage = false;
+        this.armedAt    = -1L;
     }
 
     /**
@@ -133,11 +153,13 @@ public class NoStop extends Module {
     public void onEnabled() {
         this.hitLanded  = false;
         this.tookDamage = false;
+        this.armedAt    = -1L;
     }
 
     @Override
     public void onDisabled() {
         this.hitLanded  = false;
         this.tookDamage = false;
+        this.armedAt    = -1L;
     }
 }
