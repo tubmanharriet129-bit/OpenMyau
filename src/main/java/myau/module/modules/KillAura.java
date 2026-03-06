@@ -153,21 +153,23 @@ public class KillAura extends Module {
         if (this.hitSelectBurst.getValue()) {
             long now = System.currentTimeMillis();
 
-            // Post-burst pause — wait xxx ms before starting next burst
+            // Post-burst pause
             if (now < this.burstPauseUntil) return true;
 
-            // 8 hits fired — arm the pause
+            // 8 hits fired — arm pause and reset
             if (this.burstHitCount >= 8) {
                 this.burstPauseUntil = now + this.hitSelectBurstPause.getValue();
                 this.burstHitCount = 0;
                 return true;
             }
 
-            // First hit fires immediately
+            // First hit fires immediately after pause ends
             if (this.burstHitCount == 0) return false;
 
-            // Remaining 7 hits: 25ms between each input
-            if (now - this.lastHitTime < 25L) return true;
+            // Space remaining 7 hits evenly across the pause duration
+            // interval = pauseMs / 8  (e.g. 300ms → 37ms, 380ms → 47ms)
+            long interval = this.hitSelectBurstPause.getValue() / 8L;
+            if (now - this.lastHitTime < interval) return true;
         }
 
         return false;
@@ -427,8 +429,8 @@ public class KillAura extends Module {
 
         // ── Hit Select ────────────────────────────────────────────────────────
         this.hitSelectBurst = new BooleanProperty("hit-select-burst", false);
-        // Pause after each burst of 8 hits in ms (0–1000, default 200).
-        this.hitSelectBurstPause = new IntProperty("hit-select-burst-pause", 200, 0, 1000,
+        // Pause after each burst of 8 hits in ms (0–400, default 300).
+        this.hitSelectBurstPause = new IntProperty("hit-select-burst-pause", 300, 0, 400,
                 this.hitSelectBurst::getValue);
     }
 
