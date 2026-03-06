@@ -8,11 +8,9 @@ import myau.module.Module;
 import myau.property.properties.BooleanProperty;
 import myau.property.properties.IntProperty;
 import myau.util.ItemUtil;
-import myau.util.PacketUtil;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.play.client.C02PacketUseEntity;
 import net.minecraft.network.play.client.C02PacketUseEntity.Action;
-import net.minecraft.network.play.client.C0BPacketEntityAction;
 import net.minecraft.network.play.server.S06PacketUpdateHealth;
 
 public class NoStop extends Module {
@@ -21,39 +19,35 @@ public class NoStop extends Module {
     // -------------------------------------------------------
     // Internal state
     // -------------------------------------------------------
-    private long delayRemaining = 0L;  // ms until STOP_SPRINTING fires
-    private long stopRemaining  = 0L;  // ms until START_SPRINTING fires
-    private boolean armed    = false;  // waiting for delay to expire
-    private boolean stopping = false;  // currently in stop phase
+
+    /** Ticks remaining in the stop phase (sprint is off). */
+    private int stopTicksRemaining = 0;
+
+    /** True when we've completed a stop and are waiting one tick to re-sprint. */
+    private boolean resprintPending = false;
 
     // -------------------------------------------------------
     // Properties
     // -------------------------------------------------------
 
     /**
-     * How long to wait after the trigger event before sending STOP_SPRINTING.
-     * Lower values are more aggressive but may increase knockback taken.
-     * 200-300ms is generally optimal.
+     * How many ticks to stop sprinting after a hit (1 tick = 50ms).
+     * 1 tick is enough to register a sprint reset with minimal slowdown.
+     * Higher values look more natural but slow you down more.
      */
-    public final IntProperty delayAfterAttack;
-
-    /**
-     * How long to hold STOP_SPRINTING before sending START_SPRINTING.
-     * Higher values look more legit but slow you down more.
-     */
-    public final IntProperty stopDuration;
-
-    /**
-     * When enabled, the sprint reset only fires after you take damage,
-     * rather than on every attack. Produces better timing and tends to
-     * reduce your own knockback more consistently.
-     */
-    public final BooleanProperty waitForDamage;
+    public final IntProperty stopTicks;
 
     /**
      * When enabled, the module only activates while holding a sword.
      */
     public final BooleanProperty weaponOnly;
+
+    /**
+     * When enabled, only triggers after you take damage yourself rather
+     * than on every hit you land. Produces better knockback reduction
+     * at the cost of less frequent resets.
+     */
+    public final BooleanProperty waitForDamage;
 
     // -------------------------------------------------------
     // Constructor
@@ -61,10 +55,9 @@ public class NoStop extends Module {
 
     public NoStop() {
         super("NoStop", false);
-        this.delayAfterAttack = new IntProperty("delay", 250, 0, 500);
-        this.stopDuration     = new IntProperty("stop-duration", 100, 50, 500);
-        this.waitForDamage    = new BooleanProperty("wait-for-damage", false);
-        this.weaponOnly       = new BooleanProperty("weapon-only", true);
+        this.stopTicks    = new IntProperty("stop-ticks", 1, 1, 5);
+        this.weaponOnly   = new BooleanProperty("weapon-only", true);
+        this.waitForDamage = new BooleanProperty("wait-for-damage", false);
     }
 
     // -------------------------------------------------------
@@ -72,22 +65,23 @@ public class NoStop extends Module {
     // -------------------------------------------------------
 
     private boolean canActivate() {
+        if (!mc.thePlayer.isSprinting()) return false;
         if (this.weaponOnly.getValue() && !ItemUtil.isHoldingSword()) return false;
-        return mc.thePlayer.isSprinting();
+        return true;
     }
 
-    private void arm() {
-        this.armed          = true;
-        this.stopping       = false;
-        this.delayRemaining = this.delayAfterAttack.getValue();
-        this.stopRemaining  = 0L;
+    private void triggerReset() {
+        this.stopTicksRemaining = this.stopTicks.getValue();
+        this.resprintPending    = false;
     }
 
     private void resetState() {
-        this.armed          = false;
-        this.stopping       = false;
-        this.delayRemaining = 0L;
-        this.stopRemaining  = 0L;
+        this.stopTicksRemaining = 0;
+        this.resprintPending    = false;
+        // Restore sprint in case we disabled mid-stop
+        if (mc.thePlayer != null && !mc.thePlayer.isSprinting()) {
+            mc.thePlayer.setSprinting(true);
+        }
     }
 
     // -------------------------------------------------------
@@ -98,30 +92,23 @@ public class NoStop extends Module {
     public void onUpdate(UpdateEvent event) {
         if (!this.isEnabled() || mc.thePlayer == null) return;
         if (event.getType() != EventType.PRE) return;
-        if (!this.armed) return;
 
-        if (this.delayRemaining > 0L) {
-            // Still waiting out the pre-fire delay
-            this.delayRemaining -= 50L;
-        } else if (!this.stopping) {
-            // Delay expired — send STOP_SPRINTING and enter stop phase
-            PacketUtil.sendPacket(new C0BPacketEntityAction(
-                    mc.thePlayer, C0BPacketEntityAction.Action.STOP_SPRINTING
-            ));
-            this.stopping      = true;
-            this.stopRemaining = this.stopDuration.getValue();
-        } else {
-            // In stop phase — count down stop duration
-            if (this.stopRemaining > 0L) {
-                this.stopRemaining -= 50L;
+        if (this.stopTicksRemaining > 0) {
+            // Stop phase: hold sprint off for the configured number of ticks
+            mc.thePlayer.setSprinting(false);
+            this.stopTicksRemaining--;
+
+            if (this.stopTicksRemaining == 0) {
+                // Stop phase done — queue re-sprint for next tick
+                this.resprintPending = true;
             }
-            if (this.stopRemaining <= 0L) {
-                // Stop phase done — send START_SPRINTING and finish
-                PacketUtil.sendPacket(new C0BPacketEntityAction(
-                        mc.thePlayer, C0BPacketEntityAction.Action.START_SPRINTING
-                ));
-                this.resetState();
-            }
+        } else if (this.resprintPending) {
+            // Re-sprint phase: turn sprint back on immediately
+            // setSprinting(true) goes through the normal game path — the
+            // server receives START_SPRINTING as a natural consequence of
+            // the sprint state change, not as an injected standalone packet
+            mc.thePlayer.setSprinting(true);
+            this.resprintPending = false;
         }
     }
 
@@ -129,23 +116,25 @@ public class NoStop extends Module {
     public void onPacket(PacketEvent event) {
         if (!this.isEnabled() || event.isCancelled() || mc.thePlayer == null) return;
 
-        // Standard mode: arm on outgoing attack packet
+        // Standard mode: trigger on outgoing attack packet
         if (event.getType() == EventType.SEND
                 && event.getPacket() instanceof C02PacketUseEntity
                 && ((C02PacketUseEntity) event.getPacket()).getAction() == Action.ATTACK
                 && !this.waitForDamage.getValue()
-                && !this.armed
+                && this.stopTicksRemaining == 0
+                && !this.resprintPending
                 && this.canActivate()) {
-            this.arm();
+            this.triggerReset();
         }
 
-        // Wait-for-damage mode: arm when we receive a health reduction packet
+        // Wait-for-damage mode: trigger when we take a health hit
         if (event.getPacket() instanceof S06PacketUpdateHealth
                 && this.waitForDamage.getValue()
-                && !this.armed) {
+                && this.stopTicksRemaining == 0
+                && !this.resprintPending) {
             float incomingHealth = ((S06PacketUpdateHealth) event.getPacket()).getHealth();
             if (incomingHealth < mc.thePlayer.getHealth() && this.canActivate()) {
-                this.arm();
+                this.triggerReset();
             }
         }
     }
@@ -156,7 +145,8 @@ public class NoStop extends Module {
 
     @Override
     public void onEnabled() {
-        this.resetState();
+        this.stopTicksRemaining = 0;
+        this.resprintPending    = false;
     }
 
     @Override
