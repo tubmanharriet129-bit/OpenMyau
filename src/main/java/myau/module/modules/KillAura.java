@@ -127,19 +127,15 @@ public class KillAura extends Module {
      */
     public final PercentProperty hitSelectCancelRate;
     /**
-     * Burst mode: fire hits at a jitter-patterned rate up to hitSelectBurstHits,
-     * then pause for hitSelectBurstPause ms before starting a new burst.
-     * The first hit of each burst always fires immediately with no delay.
+     * Burst mode: fires hits at a hardcoded ~7-8 CPS pattern, then pauses
+     * for hitSelectBurstPause ms before starting the next burst.
+     * The first hit of each burst always fires immediately.
      */
     public final BooleanProperty hitSelectBurst;
-    /** Clicks per second during the burst (default 8). Controls inter-hit interval. */
-    public final IntProperty hitSelectBurstCPS;
     /** Number of hits per burst before the pause fires (default 8). */
     public final IntProperty hitSelectBurstHits;
     /** How long to pause after a burst completes, in ms (default 200). */
     public final IntProperty hitSelectBurstPause;
-    /** Random jitter applied to each inter-hit interval in ms (default 15). */
-    public final IntProperty hitSelectBurstJitter;
 
     // -------------------------------------------------------
     // Internal helpers
@@ -190,10 +186,9 @@ public class KillAura extends Module {
             }
         }
 
-        // Gate 2: jitter burst pattern
-        // Fires hits at ~hitSelectBurstCPS with slight randomisation, then
-        // pauses for hitSelectBurstPause ms before starting the next burst.
-        // The first hit of every burst always passes through immediately.
+        // Gate 2: burst pattern — hits at hardcoded ~7-8 CPS, then pause.
+        // CPS is baked in: base interval 125ms (8 CPS) ±15ms jitter = 110–140ms,
+        // producing a natural 7–8 CPS feel. Only pause and hit count are configurable.
         if (this.hitSelectBurst.getValue()) {
             long now = System.currentTimeMillis();
 
@@ -207,16 +202,17 @@ public class KillAura extends Module {
                 return true;
             }
 
-            // First hit of the burst always fires immediately
+            // First hit of each burst always fires immediately
             if (this.burstHitCount == 0) return false;
 
-            // Subsequent hits: enforce CPS interval with jitter
-            long baseInterval = 1000L / (long) this.hitSelectBurstCPS.getValue();
-            long jitter = (long) RandomUtil.nextFloat(
-                    -(float) this.hitSelectBurstJitter.getValue(),
-                     (float) this.hitSelectBurstJitter.getValue()
-            );
-            if (now - this.lastHitTime < baseInterval + jitter) return true;
+            // Subsequent hits: simulate jitter click rhythm.
+            // Real jitter clicking is not evenly spaced — it alternates between
+            // quick clicks (~85-100ms) and slightly longer gaps (~130-145ms),
+            // producing irregular bursts that average out to ~7-8 CPS.
+            long interval = (this.burstHitCount % 2 == 0)
+                    ? 85L  + (long) RandomUtil.nextFloat(0.0F, 15.0F)   // short click: 85-100ms
+                    : 130L + (long) RandomUtil.nextFloat(0.0F, 15.0F);  // longer gap:  130-145ms
+            if (now - this.lastHitTime < interval) return true;
         }
 
         return false;
@@ -492,17 +488,11 @@ public class KillAura extends Module {
         // Burst mode: additionally gate attacks by the target's i-frame timer,
         // only passing through clicks that will actually deal damage.
         this.hitSelectBurst = new BooleanProperty("hit-select-burst", false);
-        // CPS during the burst (1–20, default 8).
-        this.hitSelectBurstCPS = new IntProperty("hit-select-burst-cps", 8, 1, 20,
-                this.hitSelectBurst::getValue);
         // Hits per burst before the pause fires (1–20, default 8).
         this.hitSelectBurstHits = new IntProperty("hit-select-burst-hits", 8, 1, 20,
                 this.hitSelectBurst::getValue);
         // Pause after burst completes in ms (0–1000, default 200).
         this.hitSelectBurstPause = new IntProperty("hit-select-burst-pause", 200, 0, 1000,
-                this.hitSelectBurst::getValue);
-        // Per-hit interval jitter in ms (0–50, default 15).
-        this.hitSelectBurstJitter = new IntProperty("hit-select-burst-jitter", 15, 0, 50,
                 this.hitSelectBurst::getValue);
     }
 
