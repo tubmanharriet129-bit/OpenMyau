@@ -222,7 +222,13 @@ public class BackTrack extends Module {
     public void onPacket(PacketEvent event) {
         if (!this.isEnabled() || mc.thePlayer == null || mc.theWorld == null) return;
 
-        // Only intercept inbound packets
+        // Outbound: detect attacks to arm engagement — YOUR movement is never touched
+        if (event.getType() == EventType.SEND) {
+            this.handleOutboundAttack(event.getPacket());
+            return; // never cancel outbound
+        }
+
+        // Only intercept inbound packets beyond this point
         if (event.getType() != EventType.RECEIVE) return;
         // YOUR outbound packets are NEVER touched — no outbound handling at all
 
@@ -299,34 +305,6 @@ public class BackTrack extends Module {
     }
 
     // ── Attack hook — arm on first hit ────────────────────────────────────
-
-    @EventTarget
-    public void onAttack(EventAttackEntity event) {
-        if (!(event.getEntity() instanceof EntityLivingBase)) return;
-
-        EntityLivingBase target = (EntityLivingBase) event.getEntity();
-        double dist = mc.thePlayer.getDistanceToEntity(target);
-        if (dist < this.minDistance.getValue() || dist > this.maxDistance.getValue()) return;
-
-        int id = target.getEntityId();
-
-        if (!this.engaged || this.targetId != id) {
-            // New target or first engagement — flush old buffer if switching
-            if (this.targetId != -1 && this.targetId != id) {
-                this.flushAll();
-            }
-            this.targetId    = id;
-            this.engaged     = true;
-            this.bufferStart = System.currentTimeMillis();
-            this.prevYTracked = false;
-        } else if (this.engaged) {
-            // Already engaged with this target — rearm if buffer drained
-            Deque<Packet<?>> buf = this.getBuffer(id);
-            if (buf == null || buf.isEmpty()) {
-                this.bufferStart = System.currentTimeMillis();
-            }
-        }
-    }
 
     // ── Buffer helpers ────────────────────────────────────────────────────
 
