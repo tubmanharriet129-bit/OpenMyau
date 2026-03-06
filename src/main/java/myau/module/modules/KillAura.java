@@ -186,13 +186,13 @@ public class KillAura extends Module {
             }
         }
 
-        // Gate 2: burst pattern — hits at hardcoded ~7-8 CPS, then pause.
-        // CPS is baked in: base interval 125ms (8 CPS) ±15ms jitter = 110–140ms,
-        // producing a natural 7–8 CPS feel. Only pause and hit count are configurable.
+        // Gate 2: burst pattern — continuous ~8 CPS with minimal variation.
+        // Hits fire every ~125ms with a tiny ±10ms natural variation.
+        // The ONLY meaningful gap is the post-burst pause between bursts.
         if (this.hitSelectBurst.getValue()) {
             long now = System.currentTimeMillis();
 
-            // Post-burst pause: hold until pause window expires
+            // Post-burst pause: the only real break between hits
             if (now < this.burstPauseUntil) return true;
 
             // Burst just completed: arm the post-burst pause and reset count
@@ -205,13 +205,8 @@ public class KillAura extends Module {
             // First hit of each burst always fires immediately
             if (this.burstHitCount == 0) return false;
 
-            // Subsequent hits: simulate jitter click rhythm.
-            // Real jitter clicking is not evenly spaced — it alternates between
-            // quick clicks (~85-100ms) and slightly longer gaps (~130-145ms),
-            // producing irregular bursts that average out to ~7-8 CPS.
-            long interval = (this.burstHitCount % 2 == 0)
-                    ? 85L  + (long) RandomUtil.nextFloat(0.0F, 15.0F)   // short click: 85-100ms
-                    : 130L + (long) RandomUtil.nextFloat(0.0F, 15.0F);  // longer gap:  130-145ms
+            // All subsequent hits: flat ~125ms (8 CPS) with tiny ±10ms variation
+            long interval = 115L + (long) RandomUtil.nextFloat(0.0F, 20.0F);
             if (now - this.lastHitTime < interval) return true;
         }
 
