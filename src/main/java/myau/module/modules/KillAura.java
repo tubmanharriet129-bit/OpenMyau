@@ -74,7 +74,7 @@ public class KillAura extends Module {
     // At midTrade == 0 the feature is fully disabled.
     private long midTradePauseUntil = 0L;
     // Epoch ms of the most recent target-entity-id change.
-    private long lastTargetSwitchTime = 0L;
+   long lastTargetSwitchTime = 0L;  // package-private for BackTrack
     // Entity ID that was active on the previous targeting tick.
     private int lastTargetId = -1;
 
@@ -1157,3 +1157,4 @@ public class KillAura extends Module {
         }
     }
 }
+
