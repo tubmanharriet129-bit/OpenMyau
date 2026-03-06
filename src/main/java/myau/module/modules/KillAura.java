@@ -473,7 +473,13 @@ public class KillAura extends Module {
     // Public API
     // -------------------------------------------------------
 
-    public EntityLivingBase getTarget() {
+    public EntityLivingBase getTarget() public EntityLivingBase getTarget() {
+    return this.target != null ? this.target.getEntity() : null;
+}
+
+public long getLastTargetSwitchTime() {
+    return this.lastTargetSwitchTime;
+} {
         return this.target != null ? this.target.getEntity() : null;
     }
 
@@ -1157,4 +1163,5 @@ public class KillAura extends Module {
         }
     }
 }
+
 
