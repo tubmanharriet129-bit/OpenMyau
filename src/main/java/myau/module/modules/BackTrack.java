@@ -11,7 +11,6 @@ import myau.property.properties.BooleanProperty;
 import myau.property.properties.FloatProperty;
 import myau.property.properties.IntProperty;
 import myau.property.properties.ModeProperty;
-import myau.util.MSTimer;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.GlStateManager;
 import net.minecraft.client.renderer.RenderGlobal;
@@ -20,49 +19,17 @@ import net.minecraft.entity.EntityLivingBase;
 import net.minecraft.network.Packet;
 import net.minecraft.network.play.client.C02PacketUseEntity;
 import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.server.S0FPacketSpawnMob;
 import net.minecraft.network.play.server.S14PacketEntity;
 import net.minecraft.network.play.server.S18PacketEntityTeleport;
-import net.minecraft.network.play.server.S0FPacketSpawnMob;
 import net.minecraft.util.AxisAlignedBB;
 import net.minecraft.util.Vec3;
 
-import java.util.*;
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.Map;
+import java.util.Queue;
 
-/**
- * OutboundBackTrack — delays your own outgoing packets (movement + attacks)
- * so the server processes them against the target's lagged position.
- *
- * How it works
- * ─────────────
- * Incoming packets (server → client) pass through untouched, so entities
- * move naturally on your screen. You see everything in real time.
- *
- * Outgoing packets (client → server) are queued for `delay` ms before being
- * sent. From the server's perspective you appear to be at a slightly older
- * position, identical to having high ping. Your attacks therefore register
- * on where the target *was*, which on Hypixel's prediction AC is processed
- * as a legitimate lagged hit rather than a reach violation.
- *
- * maxHurtTime gating
- * ──────────────────
- * Continuously delaying every tick looks mechanical. maxHurtTime lets you
- * gate the lag so it only runs while the target still has iFrames remaining
- * (hurtResistantTime > 0) — the moment they are hittable the queue flushes,
- * landing your delayed packets exactly when damage can register. Set it to
- * 500 (max) for constant lag, or lower for burst-on-cooldown behaviour.
- *
- * Range management
- * ─────────────────
- * When the target exits maxRange, or KillAura drops the target, the queue
- * is flushed immediately so your own position never desyncs server-side.
- *
- * Attack-only mode
- * ─────────────────
- * Setting delayMovement=false only delays C02PacketUseEntity (swing/attack)
- * packets — movement is sent instantly. This is safer on anti-cheats that
- * watch for movement inconsistencies while still giving the double-hit
- * window benefit on attacks.
- */
 public class BackTrack extends Module {
 
     private static final Minecraft mc = Minecraft.getMinecraft();
@@ -71,23 +38,18 @@ public class BackTrack extends Module {
     // Properties
     // ─────────────────────────────────────────────────────────────
 
-    /** Artificial lag in ms to add to outgoing packets. */
+    /** Artificial lag in ms added to outgoing packets. */
     public final IntProperty delay =
             new IntProperty("delay", 50, 10, 300);
 
     /**
-     * Maximum hurtResistantTime (ms) the target may have before the lag
-     * is applied. When hurtTime > this value, packets are sent immediately.
-     *
-     * 500 = always lag (smooth constant delay).
-     * 200 = only lag when the target has < 4 ticks of iFrames left
-     *        — produces a short burst of lag right before they're hittable,
-     *          maximising double-hit chance while looking natural otherwise.
+     * Maximum hurtResistantTime (ms) the target may have for the lag to apply.
+     * 500 = always lag. Lower = burst only near the damage window.
      */
     public final IntProperty maxHurtTime =
             new IntProperty("max-hurt-time", 500, 0, 500);
 
-    /** Distance below which BackTrack activates. */
+    /** Distance above which BackTrack activates. */
     public final FloatProperty maxRange =
             new FloatProperty("max-range", 4.0f, 2.0f, 10.0f);
 
@@ -104,10 +66,10 @@ public class BackTrack extends Module {
             new BooleanProperty("flush-on-hit", true);
 
     /** Safety cap: flush everything after this many ms regardless. */
-    public final IntProperty maxDelay =
+    public final IntProperty maxDelayCap =
             new IntProperty("max-delay-cap", 400, 50, 1000);
 
-    /** Render server-side hitbox of target while lagging. */
+    /** Render the server-side hitbox of the target while lagging. */
     public final BooleanProperty esp =
             new BooleanProperty("esp", true);
 
@@ -118,22 +80,14 @@ public class BackTrack extends Module {
     // Internal state
     // ─────────────────────────────────────────────────────────────
 
-    /**
-     * Queue of outgoing packets waiting to be released.
-     * Each entry pairs the packet with the System.currentTimeMillis()
-     * timestamp at which it was intercepted.
-     */
+    /** Queued outgoing packets waiting to be released after their delay. */
     private final Queue<TimedPacket> outboundQueue = new LinkedList<>();
 
-    /**
-     * Tracks the interpolated server-side position of every entity by
-     * accumulating incoming relative-move and teleport deltas.
-     * Used purely for the ESP overlay and shouldActivate() check.
-     */
+    /** Tracks interpolated server-side positions from incoming move packets. */
     private final Map<Integer, Vec3> serverPositions = new HashMap<>();
 
-    /** How long the current hold has been active (safety cap enforcement). */
-    private final MSTimer holdTimer = new MSTimer();
+    /** Timestamp (ms) when the current hold started. -1 = not holding. */
+    private long holdStart = -1L;
 
     private boolean holding = false;
     private EntityLivingBase target = null;
@@ -167,8 +121,8 @@ public class BackTrack extends Module {
         outboundQueue.clear();
         serverPositions.clear();
         holding = false;
+        holdStart = -1L;
         target = null;
-        holdTimer.reset();
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -180,8 +134,7 @@ public class BackTrack extends Module {
         if (!isEnabled() || mc.thePlayer == null || mc.theWorld == null) return;
         if (killAura == null) return;
 
-        // ── Incoming packets → track server-side positions (never blocked) ──
-
+        // ── Incoming: track server-side positions, never block ──
         if (event.getType() == EventType.RECEIVE) {
             Packet<?> pkt = event.getPacket();
 
@@ -206,17 +159,16 @@ public class BackTrack extends Module {
                 serverPositions.put(p.getEntityID(),
                         new Vec3(p.getX() / 32.0, p.getY() / 32.0, p.getZ() / 32.0));
             }
-            return; // never cancel incoming packets
+            return;
         }
 
-        // ── Outgoing packets → queue if holding ──
-
+        // ── Outgoing: queue if currently holding ──
         if (event.getType() != EventType.SEND) return;
         if (!holding) return;
 
         Packet<?> pkt = event.getPacket();
-        boolean isMovement = pkt instanceof C03PacketPlayer;
         boolean isAttack   = pkt instanceof C02PacketUseEntity;
+        boolean isMovement = pkt instanceof C03PacketPlayer;
 
         if (isAttack || (isMovement && delayMovement.getValue())) {
             outboundQueue.add(new TimedPacket(pkt, System.currentTimeMillis()));
@@ -235,7 +187,6 @@ public class BackTrack extends Module {
 
         EntityLivingBase newTarget = killAura.getTarget();
 
-        // Target changed — flush everything for the old target.
         if (newTarget != target) {
             if (holding) stopHolding();
             target = newTarget;
@@ -246,13 +197,14 @@ public class BackTrack extends Module {
             return;
         }
 
-        // Safety cap — never hold longer than maxDelayCap.
-        if (holding && holdTimer.hasTimePassed(maxDelay.getValue())) {
+        // Safety cap.
+        if (holding && holdStart != -1L
+                && (System.currentTimeMillis() - holdStart) > maxDelayCap.getValue()) {
             stopHolding();
             return;
         }
 
-        // Flush on hit (player receives knockback).
+        // Flush on knockback.
         if (flushOnHit.getValue()
                 && mc.thePlayer.hurtTime == mc.thePlayer.maxHurtTime
                 && mc.thePlayer.maxHurtTime > 0) {
@@ -260,17 +212,15 @@ public class BackTrack extends Module {
             return;
         }
 
-        // Decide whether to hold this tick.
         if (shouldHold()) {
             if (!holding) {
                 holding = true;
-                holdTimer.reset();
+                holdStart = System.currentTimeMillis();
             }
         } else {
             if (holding) stopHolding();
         }
 
-        // Release packets whose delay has expired.
         if (holding) drainExpired();
     }
 
@@ -278,12 +228,6 @@ public class BackTrack extends Module {
     // Activation condition
     // ─────────────────────────────────────────────────────────────
 
-    /**
-     * Hold outbound packets when:
-     *   1. Target is within [minRange, maxRange].
-     *   2. The target's iFrames are within our maxHurtTime gate
-     *      (so we only lag when a hit will count soon).
-     */
     private boolean shouldHold() {
         if (target == null) return false;
 
@@ -291,7 +235,6 @@ public class BackTrack extends Module {
         if (dist < minRange.getValue()) return false;
         if (dist > maxRange.getValue()) return false;
 
-        // hurtResistantTime in ticks → ms (50 ms/tick).
         int hurtTimeMs = target.hurtResistantTime * 50;
         if (hurtTimeMs > maxHurtTime.getValue()) return false;
 
@@ -302,11 +245,6 @@ public class BackTrack extends Module {
     // Queue management
     // ─────────────────────────────────────────────────────────────
 
-    /**
-     * Drain any queued packets whose queued timestamp + delay has passed.
-     * This creates the authentic "high ping" cadence — packets emerge
-     * individually at the correct delayed time rather than all at once.
-     */
     private void drainExpired() {
         long now = System.currentTimeMillis();
         int delayMs = delay.getValue();
@@ -317,12 +255,11 @@ public class BackTrack extends Module {
                 outboundQueue.poll();
                 sendImmediate(head.packet);
             } else {
-                break; // queue is FIFO; if head isn't ready, nothing else is
+                break;
             }
         }
     }
 
-    /** Flush all held packets immediately (no delay). */
     private void flush() {
         while (!outboundQueue.isEmpty()) {
             sendImmediate(outboundQueue.poll().packet);
@@ -332,20 +269,18 @@ public class BackTrack extends Module {
     private void stopHolding() {
         flush();
         holding = false;
+        holdStart = -1L;
     }
 
-    /**
-     * Send a packet directly to the server, bypassing our packet event
-     * so it isn't intercepted and re-queued.
-     */
     private void sendImmediate(Packet<?> packet) {
-        if (mc.getNetHandler() != null && mc.getNetHandler().getNetworkManager() != null) {
+        if (mc.getNetHandler() != null
+                && mc.getNetHandler().getNetworkManager() != null) {
             mc.getNetHandler().getNetworkManager().sendPacket(packet);
         }
     }
 
     // ─────────────────────────────────────────────────────────────
-    // ESP — draws the server-side (real) hitbox while lagging
+    // ESP
     // ─────────────────────────────────────────────────────────────
 
     @EventTarget
@@ -356,13 +291,9 @@ public class BackTrack extends Module {
         Vec3 real = serverPositions.get(target.getEntityId());
         if (real == null) return;
 
-        double rx = mc.getRenderManager().viewerPosX;
-        double ry = mc.getRenderManager().viewerPosY;
-        double rz = mc.getRenderManager().viewerPosZ;
-
-        double x = real.xCoord - rx;
-        double y = real.yCoord - ry;
-        double z = real.zCoord - rz;
+        double x = real.xCoord - mc.getRenderManager().viewerPosX;
+        double y = real.yCoord - mc.getRenderManager().viewerPosY;
+        double z = real.zCoord - mc.getRenderManager().viewerPosZ;
 
         double hw = target.width / 2.0;
         AxisAlignedBB box = new AxisAlignedBB(
@@ -384,10 +315,9 @@ public class BackTrack extends Module {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // TimedPacket helper
+    // TimedPacket
     // ─────────────────────────────────────────────────────────────
 
-    /** Pairs an outgoing packet with the wall-clock time it was captured. */
     private static final class TimedPacket {
         final Packet<?> packet;
         final long timestamp;
