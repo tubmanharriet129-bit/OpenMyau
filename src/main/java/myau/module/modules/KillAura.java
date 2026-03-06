@@ -429,8 +429,9 @@ public class KillAura extends Module {
 
         // ── Hit Select ────────────────────────────────────────────────────────
         this.hitSelectBurst = new BooleanProperty("hit-select-burst", false);
-        // Pause after each burst of 8 hits in ms (0–400, default 300).
-        this.hitSelectBurstPause = new IntProperty("hit-select-burst-pause", 300, 0, 400,
+        // Pause between bursts in ms (0–500, default 300).
+        // 500ms = one full hurt time / i-frame window.
+        this.hitSelectBurstPause = new IntProperty("hit-select-burst-pause", 300, 0, 500,
                 this.hitSelectBurst::getValue);
     }
 
