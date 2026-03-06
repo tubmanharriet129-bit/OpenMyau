@@ -64,6 +64,20 @@ public class KillAura extends Module {
     private long attackDelayMS = 0L;
     private int blockTick = 0;
     private int lastTickProcessed;
+
+    // -------------------------------------------------------
+    // Mid Trade state
+    // -------------------------------------------------------
+    // Counts confirmed attacks in the current burst (resets at 2).
+    private int midTradeAttackCount = 0;
+    // Epoch ms at which the burst pause expires. Attacks are held while
+    // System.currentTimeMillis() < midTradePauseUntil.
+    private long midTradePauseUntil = 0L;
+    // Epoch ms of the most recent target-entity-id change.
+    private long lastTargetSwitchTime = 0L;
+    // Entity ID that was active on the previous target-selection tick.
+    private int lastTargetId = -1;
+
     public final ModeProperty mode;
     public final ModeProperty sort;
     public final ModeProperty autoBlock;
@@ -71,7 +85,6 @@ public class KillAura extends Module {
     public final FloatProperty autoBlockMinCPS;
     public final FloatProperty autoBlockMaxCPS;
     public final FloatProperty autoBlockRange;
-    public final IntProperty maxHurtTime;
     public final FloatProperty swingRange;
     public final FloatProperty attackRange;
     public final IntProperty fov;
@@ -83,7 +96,6 @@ public class KillAura extends Module {
     public final PercentProperty smoothing;
     public final IntProperty angleStep;
     public final BooleanProperty throughWalls;
-    public final BooleanProperty swingThrough;
     public final BooleanProperty requirePress;
     public final BooleanProperty allowMining;
     public final BooleanProperty weaponsOnly;
@@ -100,15 +112,94 @@ public class KillAura extends Module {
     public final ModeProperty showTarget;
     public final ModeProperty debugLog;
 
+    // -------------------------------------------------------
+    // Mid Trade properties
+    // -------------------------------------------------------
+    // midTrade            : 0 = disabled. 1-500 = exact ms pause inserted after
+    //                       every 2nd attack. 500 covers the full 1.8 hurt time.
+    // midTradeResetWindow : 0 = bypass disabled. 1-500 = if a target switch
+    //                       occurred within this many ms the active burst pause
+    //                       is cleared and the counter resets immediately,
+    //                       letting you continue attacking the new target.
+    public final IntProperty midTrade;
+    public final IntProperty midTradeResetWindow;
+
+    // -------------------------------------------------------
+    // Internal helpers
+    // -------------------------------------------------------
+
     private long getAttackDelay() {
-        return this.isBlocking ? (long) (1000.0F / RandomUtil.nextLong(this.autoBlockMinCPS.getValue().longValue(), this.autoBlockMaxCPS.getValue().longValue())) : 1000L / RandomUtil.nextLong(this.minCPS.getValue(), this.maxCPS.getValue());
+        return this.isBlocking
+                ? (long) (1000.0F / RandomUtil.nextLong(this.autoBlockMinCPS.getValue().longValue(), this.autoBlockMaxCPS.getValue().longValue()))
+                : 1000L / RandomUtil.nextLong(this.minCPS.getValue(), this.maxCPS.getValue());
     }
+
+    /**
+     * Returns true when the Mid Trade burst pause is currently blocking attacks.
+     *
+     * Bypass rule: if midTradeResetWindow > 0 and the player switched targets
+     * within that exact ms window, the pause is cleared and this returns false,
+     * allowing immediate attacking on the new target.
+     */
+    private boolean isMidTradePaused() {
+        // Feature is off when slider is at 0.
+        if (this.midTrade.getValue() == 0) return false;
+
+        // Pause has already expired naturally.
+        if (System.currentTimeMillis() >= this.midTradePauseUntil) return false;
+
+        // Rapid-switch bypass: only active when the window slider is above 0.
+        if (this.midTradeResetWindow.getValue() > 0) {
+            long msSinceSwitch = System.currentTimeMillis() - this.lastTargetSwitchTime;
+            if (msSinceSwitch <= this.midTradeResetWindow.getValue()) {
+                // Clear the pause so further calls also return false this burst.
+                this.midTradePauseUntil = 0L;
+                this.midTradeAttackCount = 0;
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Called after every confirmed attack to track the burst count.
+     * On the 2nd attack the pause timer is armed with exactly midTrade ms.
+     */
+    private void advanceMidTrade() {
+        if (this.midTrade.getValue() == 0) return;
+
+        this.midTradeAttackCount++;
+        if (this.midTradeAttackCount >= 2) {
+            this.midTradeAttackCount = 0;
+            this.midTradePauseUntil = System.currentTimeMillis() + this.midTrade.getValue();
+        }
+    }
+
+    /**
+     * Called whenever a new target entity is chosen by the targeting loop.
+     * Records the switch timestamp used by the rapid-switch bypass check.
+     */
+    private void notifyTargetChanged(int newEntityId) {
+        if (newEntityId != this.lastTargetId) {
+            this.lastTargetSwitchTime = System.currentTimeMillis();
+            this.lastTargetId = newEntityId;
+        }
+    }
+
+    // -------------------------------------------------------
+    // Core attack
+    // -------------------------------------------------------
 
     private boolean performAttack(float yaw, float pitch) {
         if (!Myau.playerStateManager.digging && !Myau.playerStateManager.placing) {
             if (this.isPlayerBlocking() && this.autoBlock.getValue() != 1) {
                 return false;
             } else if (this.attackDelayMS > 0L) {
+                return false;
+            } else if (this.isMidTradePaused()) {
+                // Mid Trade burst pause is active – hold the attack until it expires
+                // (or until a rapid target switch clears it).
                 return false;
             } else {
                 this.attackDelayMS = this.attackDelayMS + this.getAttackDelay();
@@ -117,31 +208,21 @@ public class KillAura extends Module {
                         && RotationUtil.rayTrace(this.target.getBox(), yaw, pitch, this.attackRange.getValue()) == null) {
                     return false;
                 } else {
-                    AttackEvent event = new AttackEvent(this.target.getEntity());
-                    EventManager.call(event);
+                    AttackEvent attackEvent = new AttackEvent(this.target.getEntity());
+                    EventManager.call(attackEvent);
+                    if (attackEvent.isCancelled()) {
+                        return false;
+                    }
                     ((IAccessorPlayerControllerMP) mc.playerController).callSyncCurrentPlayItem();
                     PacketUtil.sendPacket(new C02PacketUseEntity(this.target.getEntity(), Action.ATTACK));
                     if (mc.playerController.getCurrentGameType() != GameType.SPECTATOR) {
                         PlayerUtil.attackEntity(this.target.getEntity());
                     }
+                    this.hitRegistered = true;
+                    // Advance burst counter — arms the pause on the 2nd attack.
+                    this.advanceMidTrade();
                     return true;
                 }
-            }
-        } else {
-            return false;
-        }
-    }
-
-    private boolean performSwing() {
-        if (!Myau.playerStateManager.digging && !Myau.playerStateManager.placing) {
-            if (this.isPlayerBlocking() && this.autoBlock.getValue() != 1) {
-                return false;
-            } else if (this.attackDelayMS > 0L) {
-                return false;
-            } else {
-                this.attackDelayMS = this.attackDelayMS + this.getAttackDelay();
-                mc.thePlayer.swingItem();
-                return true;
             }
         } else {
             return false;
@@ -184,53 +265,11 @@ public class KillAura extends Module {
         }
     }
 
-    private boolean canAttack() {
-        if (this.inventoryCheck.getValue() && mc.currentScreen instanceof GuiContainer) {
-            return false;
-        } else if (!(Boolean) this.weaponsOnly.getValue()
-                || ItemUtil.hasRawUnbreakingEnchant()
-                || this.allowTools.getValue() && ItemUtil.isHoldingTool()) {
-            if (((IAccessorPlayerControllerMP) mc.playerController).getIsHittingBlock()) {
-                return false;
-            } else if ((ItemUtil.isEating() || ItemUtil.isUsingBow()) && PlayerUtil.isUsingItem()) {
-                return false;
-            } else {
-                AutoHeal autoHeal = (AutoHeal) Myau.moduleManager.modules.get(AutoHeal.class);
-                if (autoHeal.isEnabled() && autoHeal.isSwitching()) {
-                    return false;
-                } else {
-                    BedNuker bedNuker = (BedNuker) Myau.moduleManager.modules.get(BedNuker.class);
-                    AutoBlockIn autoBlockIn = (AutoBlockIn) Myau.moduleManager.modules.get(AutoBlockIn.class);
-                    if (bedNuker.isEnabled() && bedNuker.isReady()) {
-                        return false;
-                    } else if (Myau.moduleManager.modules.get(Scaffold.class).isEnabled()) {
-                        return false;
-                    } else if (autoBlockIn.isEnabled()) {
-                        return false;
-                    } else if (this.requirePress.getValue()) {
-                        return PlayerUtil.isAttacking();
-                    } else {
-                        return !this.allowMining.getValue() || !mc.objectMouseOver.typeOfHit.equals(MovingObjectType.BLOCK) || !PlayerUtil.isAttacking();
-                    }
-                }
-            }
-        } else {
-            return false;
-        }
-    }
-
     private boolean canAutoBlock() {
         if (!ItemUtil.isHoldingSword()) {
             return false;
-        } else if (this.autoBlockRequirePress.getValue() && !PlayerUtil.isUsingItem()) {
-            return false;
         } else {
-            if (this.maxHurtTime.getValue() > 0) {
-                if (mc.thePlayer.hurtResistantTime <= this.maxHurtTime.getValue() / 50) {
-                    return false;
-                }
-            }
-            return true;
+            return !this.autoBlockRequirePress.getValue() || PlayerUtil.isUsingItem();
         }
     }
 
@@ -255,7 +294,7 @@ public class KillAura extends Module {
                 return false;
             } else if (RotationUtil.angleToEntity(entityLivingBase) > this.fov.getValue().floatValue()) {
                 return false;
-            } else if (!this.throughWalls.getValue() && !this.swingThrough.getValue() && RotationUtil.rayTrace(entityLivingBase) != null) {
+            } else if (!this.throughWalls.getValue() && RotationUtil.rayTrace(entityLivingBase) != null) {
                 return false;
             } else if (entityLivingBase instanceof EntityOtherPlayerMP) {
                 if (!this.players.getValue()) {
@@ -263,7 +302,8 @@ public class KillAura extends Module {
                 } else if (TeamUtil.isFriend((EntityPlayer) entityLivingBase)) {
                     return false;
                 } else {
-                    return (!this.teams.getValue() || !TeamUtil.isSameTeam((EntityPlayer) entityLivingBase)) && (!this.botCheck.getValue() || !TeamUtil.isBot((EntityPlayer) entityLivingBase));
+                    return (!this.teams.getValue() || !TeamUtil.isSameTeam((EntityPlayer) entityLivingBase))
+                            && (!this.botCheck.getValue() || !TeamUtil.isBot((EntityPlayer) entityLivingBase));
                 }
             } else if (entityLivingBase instanceof EntityDragon || entityLivingBase instanceof EntityWither) {
                 return this.bosses.getValue();
@@ -345,6 +385,10 @@ public class KillAura extends Module {
         return -1;
     }
 
+    // -------------------------------------------------------
+    // Constructor
+    // -------------------------------------------------------
+
     public KillAura() {
         super("KillAura", false);
         this.lastTickProcessed = 0;
@@ -357,7 +401,6 @@ public class KillAura extends Module {
         this.autoBlockMinCPS = new FloatProperty("auto-block-min-aps", 8.0F, 1.0F, 20.0F);
         this.autoBlockMaxCPS = new FloatProperty("auto-block-max-aps", 10.0F, 1.0F, 20.0F);
         this.autoBlockRange = new FloatProperty("auto-block-range", 6.0F, 3.0F, 8.0F);
-        this.maxHurtTime = new IntProperty("max-hurt-time", 0, 0, 100);
         this.swingRange = new FloatProperty("swing-range", 3.5F, 3.0F, 6.0F);
         this.attackRange = new FloatProperty("attack-range", 3.0F, 3.0F, 6.0F);
         this.fov = new IntProperty("fov", 360, 30, 360);
@@ -369,7 +412,6 @@ public class KillAura extends Module {
         this.smoothing = new PercentProperty("smoothing", 0);
         this.angleStep = new IntProperty("angle-step", 90, 30, 180);
         this.throughWalls = new BooleanProperty("through-walls", true);
-        this.swingThrough = new BooleanProperty("swing-through", false);
         this.requirePress = new BooleanProperty("require-press", false);
         this.allowMining = new BooleanProperty("allow-mining", true);
         this.weaponsOnly = new BooleanProperty("weapons-only", true);
@@ -385,7 +427,14 @@ public class KillAura extends Module {
         this.teams = new BooleanProperty("teams", true);
         this.showTarget = new ModeProperty("show-target", 0, new String[]{"NONE", "DEFAULT", "HUD"});
         this.debugLog = new ModeProperty("debug-log", 0, new String[]{"NONE", "HEALTH"});
+        // Mid Trade sliders – every integer from 0 to 500 is a valid setting.
+        this.midTrade = new IntProperty("mid-trade", 0, 0, 500);
+        this.midTradeResetWindow = new IntProperty("mid-trade-reset", 0, 0, 500);
     }
+
+    // -------------------------------------------------------
+    // Public API
+    // -------------------------------------------------------
 
     public EntityLivingBase getTarget() {
         return this.target != null ? this.target.getEntity() : null;
@@ -406,11 +455,11 @@ public class KillAura extends Module {
 
     public boolean shouldAutoBlock() {
         if (this.isPlayerBlocking() && this.isBlocking) {
-            return !mc.thePlayer.isInWater() && !mc.thePlayer.isInLava() && (this.autoBlock.getValue() == 3  // HYPIXEL
-                    || this.autoBlock.getValue() == 4 // BLINK
-                    || this.autoBlock.getValue() == 5 // INTERACT
-                    || this.autoBlock.getValue() == 6 // SWAP
-                    || this.autoBlock.getValue() == 7); // LEGIT
+            return !mc.thePlayer.isInWater() && !mc.thePlayer.isInLava() && (this.autoBlock.getValue() == 3
+                    || this.autoBlock.getValue() == 4
+                    || this.autoBlock.getValue() == 5
+                    || this.autoBlock.getValue() == 6
+                    || this.autoBlock.getValue() == 7);
         } else {
             return false;
         }
@@ -423,6 +472,10 @@ public class KillAura extends Module {
     public boolean isPlayerBlocking() {
         return (mc.thePlayer.isUsingItem() || this.blockingState) && ItemUtil.isHoldingSword();
     }
+
+    // -------------------------------------------------------
+    // Events
+    // -------------------------------------------------------
 
     @EventTarget(Priority.LOW)
     public void onUpdate(UpdateEvent event) {
@@ -515,7 +568,7 @@ public class KillAura extends Module {
                                             break;
                                         case 1:
                                             if (this.isPlayerBlocking()) {
-                                                if(Myau.moduleManager.modules.get(NoSlow.class).isEnabled()){
+                                                if (Myau.moduleManager.modules.get(NoSlow.class).isEnabled()) {
                                                     int randomSlot = new Random().nextInt(9);
                                                     while (randomSlot == mc.thePlayer.inventory.currentItem) {
                                                         randomSlot = new Random().nextInt(9);
@@ -661,15 +714,12 @@ public class KillAura extends Module {
                                             this.blockTick = 1;
                                             break;
                                         case 1:
-                                            if (this.isPlayerBlocking() && this.attackDelayMS <= 100L) {
+                                            if (this.isPlayerBlocking()) {
                                                 this.stopBlock();
-                                                this.blockTick = 2;
+                                                attack = false;
                                             }
-                                            break;
-                                        case 2:
-                                            if (!this.isPlayerBlocking() && this.attackDelayMS <= 50L) {
-                                                swap = true;
-                                                this.blockTick = 1;
+                                            if (this.attackDelayMS <= 50L) {
+                                                this.blockTick = 0;
                                             }
                                             break;
                                         default:
@@ -683,7 +733,6 @@ public class KillAura extends Module {
                                 Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
                                 this.isBlocking = false;
                                 this.fakeBlockState = false;
-                                this.blockTick = 0;
                             }
                             break;
                         case 8: // FAKE
@@ -699,11 +748,7 @@ public class KillAura extends Module {
                     }
                 }
                 boolean attacked = false;
-                boolean behindWall = this.swingThrough.getValue()
-                        && RotationUtil.rayTrace(this.target.getEntity()) != null;
-                boolean inSwingOrWall = this.isBoxInSwingRange(this.target.getBox()) || behindWall;
-
-                if (inSwingOrWall) {
+                if (this.isBoxInSwingRange(this.target.getBox())) {
                     if (this.rotations.getValue() == 2 || this.rotations.getValue() == 3) {
                         float[] rotations = RotationUtil.getRotationsToBox(
                                 this.target.getBox(),
@@ -720,13 +765,8 @@ public class KillAura extends Module {
                             event.setPervRotation(rotations[0], 1);
                         }
                     }
-
                     if (attack) {
-                        if (behindWall) {
-                            attacked = this.performSwing();
-                        } else {
-                            attacked = this.performAttack(event.getNewYaw(), event.getNewPitch());
-                        }
+                        attacked = this.performAttack(event.getNewYaw(), event.getNewPitch());
                     }
                 }
                 if (swap) {
@@ -749,12 +789,9 @@ public class KillAura extends Module {
         if (this.isEnabled()) {
             switch (event.getType()) {
                 case PRE:
-                    boolean currentTargetBehindWall = this.swingThrough.getValue()
-                            && this.target != null
-                            && RotationUtil.rayTrace(this.target.getEntity()) != null;
                     if (this.target == null
                             || !this.isValidTarget(this.target.getEntity())
-                            || (!currentTargetBehindWall && !this.isBoxInAttackRange(this.target.getBox()))
+                            || !this.isBoxInAttackRange(this.target.getBox())
                             || !this.isBoxInSwingRange(this.target.getBox())
                             || this.timer.hasTimeElapsed(this.switchDelay.getValue().longValue())) {
                         this.timer.reset();
@@ -772,9 +809,8 @@ public class KillAura extends Module {
                             if (targets.stream().anyMatch(this::isInSwingRange)) {
                                 targets.removeIf(entityLivingBase -> !this.isInSwingRange(entityLivingBase));
                             }
-                            if (targets.stream().anyMatch(e -> this.isInAttackRange(e) || (this.swingThrough.getValue() && RotationUtil.rayTrace(e) != null))) {
-                                targets.removeIf(entityLivingBase -> !this.isInAttackRange(entityLivingBase)
-                                        && !(this.swingThrough.getValue() && RotationUtil.rayTrace(entityLivingBase) != null));
+                            if (targets.stream().anyMatch(this::isInAttackRange)) {
+                                targets.removeIf(entityLivingBase -> !this.isInAttackRange(entityLivingBase));
                             }
                             if (targets.stream().anyMatch(this::isPlayerTarget)) {
                                 targets.removeIf(entityLivingBase -> !this.isPlayerTarget(entityLivingBase));
@@ -807,7 +843,11 @@ public class KillAura extends Module {
                             if (this.mode.getValue() == 0 || this.switchTick >= targets.size()) {
                                 this.switchTick = 0;
                             }
-                            this.target = new AttackData(targets.get(this.switchTick));
+                            EntityLivingBase chosen = targets.get(this.switchTick);
+                            // Inform Mid Trade of any target change so the rapid-switch
+                            // bypass window can be evaluated on the next attack attempt.
+                            this.notifyTargetChanged(chosen.getEntityId());
+                            this.target = new AttackData(chosen);
                         }
                     }
                     if (this.target != null) {
@@ -960,6 +1000,10 @@ public class KillAura extends Module {
         }
     }
 
+    // -------------------------------------------------------
+    // Lifecycle
+    // -------------------------------------------------------
+
     @Override
     public void onEnabled() {
         this.target = null;
@@ -967,6 +1011,10 @@ public class KillAura extends Module {
         this.hitRegistered = false;
         this.attackDelayMS = 0L;
         this.blockTick = 0;
+        this.midTradeAttackCount = 0;
+        this.midTradePauseUntil = 0L;
+        this.lastTargetSwitchTime = 0L;
+        this.lastTargetId = -1;
     }
 
     @Override
@@ -975,6 +1023,10 @@ public class KillAura extends Module {
         this.blockingState = false;
         this.isBlocking = false;
         this.fakeBlockState = false;
+        this.midTradeAttackCount = 0;
+        this.midTradePauseUntil = 0L;
+        this.lastTargetSwitchTime = 0L;
+        this.lastTargetId = -1;
     }
 
     @Override
@@ -1002,14 +1054,14 @@ public class KillAura extends Module {
                 if (this.autoBlockMinCPS.getValue() > this.autoBlockMaxCPS.getValue()) {
                     this.autoBlockMaxCPS.setValue(this.autoBlockMinCPS.getValue());
                 }
-                if(autoBlockMinCPS.getValue() > 10.0F && badCps){
+                if (autoBlockMinCPS.getValue() > 10.0F && badCps) {
                     autoBlockMinCPS.setValue(10.0F);
                 }
             } else if (this.autoBlockMaxCPS.getName().equals(value)) {
                 if (this.autoBlockMinCPS.getValue() > this.autoBlockMaxCPS.getValue()) {
                     this.autoBlockMinCPS.setValue(this.autoBlockMaxCPS.getValue());
                 }
-                if(autoBlockMaxCPS.getValue() > 10.0F && badCps){
+                if (autoBlockMaxCPS.getValue() > 10.0F && badCps) {
                     autoBlockMaxCPS.setValue(10.0F);
                 }
             } else {
@@ -1029,6 +1081,10 @@ public class KillAura extends Module {
     public String[] getSuffix() {
         return new String[]{CaseFormat.UPPER_UNDERSCORE.to(CaseFormat.UPPER_CAMEL, this.mode.getModeString())};
     }
+
+    // -------------------------------------------------------
+    // AttackData
+    // -------------------------------------------------------
 
     public static class AttackData {
         private final EntityLivingBase entity;
