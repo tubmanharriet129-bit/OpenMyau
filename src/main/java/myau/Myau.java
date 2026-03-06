@@ -130,6 +130,7 @@ public class Myau {
         moduleManager.modules.put(Velocity.class, new Velocity());
         moduleManager.modules.put(ViewClip.class, new ViewClip());
         moduleManager.modules.put(Wtap.class, new Wtap());
+        moduleManager.modules.put(NoStop.class, new NoStop());
         moduleManager.modules.put(Xray.class, new Xray());
         commandManager.commands.add(new BindCommand());
         commandManager.commands.add(new ConfigCommand());
