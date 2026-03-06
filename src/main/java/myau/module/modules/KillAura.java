@@ -488,7 +488,7 @@ public class KillAura extends Module {
             if (this.attackDelayMS > 0L) {
                 this.attackDelayMS -= 50L;
             }
-            boolean attack = this.target != null && this.canAttack();
+            boolean attack = this.target != null && this.isAttackAllowed();
             boolean block = attack && this.canAutoBlock();
             if (!block) {
                 Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
@@ -965,7 +965,7 @@ public class KillAura extends Module {
         if (this.isBlocking) {
             event.setCancelled(true);
         } else {
-            if (this.isEnabled() && this.target != null && this.canAttack()) {
+            if (this.isEnabled() && this.target != null && this.isAttackAllowed()) {
                 event.setCancelled(true);
             }
         }
@@ -976,7 +976,7 @@ public class KillAura extends Module {
         if (this.isBlocking) {
             event.setCancelled(true);
         } else {
-            if (this.isEnabled() && this.target != null && this.canAttack()) {
+            if (this.isEnabled() && this.target != null && this.isAttackAllowed()) {
                 event.setCancelled(true);
             }
         }
@@ -987,7 +987,7 @@ public class KillAura extends Module {
         if (this.isBlocking) {
             event.setCancelled(true);
         } else {
-            if (this.isEnabled() && this.target != null && this.canAttack()) {
+            if (this.isEnabled() && this.target != null && this.isAttackAllowed()) {
                 event.setCancelled(true);
             }
         }
@@ -1123,3 +1123,4 @@ public class KillAura extends Module {
         }
     }
 }
+
