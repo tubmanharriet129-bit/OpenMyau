@@ -317,7 +317,8 @@ public class BackTrack extends Module {
                 // Buffer full — flush oldest packet immediately to prevent stale buildup
                 Packet<?> oldest = buf.pollFirst();
                 if (oldest != null && mc.getNetHandler() != null) {
-                    oldest.processPacket(mc.getNetHandler());
+                    //noinspection unchecked,rawtypes
+                    ((Packet) oldest).processPacket(mc.getNetHandler());
                 }
             }
             buf.addLast(packet);
@@ -389,11 +390,12 @@ public class BackTrack extends Module {
         }
     }
 
+    @SuppressWarnings({"unchecked", "rawtypes"})
     private void processDeque(Deque<Packet<?>> deque) {
         if (mc.getNetHandler() == null) return;
         for (Packet<?> p : deque) {
             try {
-                p.processPacket(mc.getNetHandler());
+                ((Packet) p).processPacket(mc.getNetHandler());
             } catch (Exception ignored) {
                 // Stale packet — skip
             }
