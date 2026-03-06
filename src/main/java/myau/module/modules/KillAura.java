@@ -69,6 +69,7 @@ public class KillAura extends Module {
     // Hit Select state
     // -------------------------------------------------------
     private long hitSelectPauseUntil = 0L;
+    private long lastHitTime = 0L;
     private boolean hitSelectFreshTarget = false;
     long lastTargetSwitchTime = 0L; // package-private for BackTrack
     private int lastTargetId = -1;
@@ -173,7 +174,7 @@ public class KillAura extends Module {
 
     if (this.hitSelectPause.getValue() > 0
             && System.currentTimeMillis() < this.hitSelectPauseUntil) {
-        if (canTakeDamage) {
+        if (entity.hurtResistantTime == 0) {
             this.hitSelectPauseUntil = 0L;
         } else {
             int rate = this.hitSelectCancelRate.getValue();
@@ -182,21 +183,19 @@ public class KillAura extends Module {
         }
     }
 
-    if (this.hitSelectBurst.getValue() && !canTakeDamage) {
-        int rate = this.hitSelectCombatCancelRate.getValue();
-        if (rate >= 100) return true;
-        if (rate > 0 && (Math.random() * 100.0) < rate) return true;
-    }
+boolean localIframes = (System.currentTimeMillis() - this.lastHitTime) < 500L;
+if (this.hitSelectBurst.getValue() && localIframes) {
 
     return false;
 }
 
     /** Called after each successful attack to arm the pause-window timer. */
-    private void armHitSelect() {
-        if (this.hitSelectPause.getValue() > 0) {
-            this.hitSelectPauseUntil = System.currentTimeMillis() + this.hitSelectPause.getValue();
-        }
+private void armHitSelect() {
+    if (this.hitSelectPause.getValue() > 0) {
+        this.hitSelectPauseUntil = System.currentTimeMillis() + this.hitSelectPause.getValue();
     }
+    this.lastHitTime = System.currentTimeMillis();
+}
 
     private void notifyTargetChanged(int newEntityId) {
     if (newEntityId != this.lastTargetId) {
@@ -1048,6 +1047,7 @@ public class KillAura extends Module {
         this.attackDelayMS = 0L;
         this.blockTick = 0;
         this.hitSelectPauseUntil = 0L;
+        this.lastHitTime = 0L;
         this.hitSelectFreshTarget = false;
         this.lastTargetSwitchTime = 0L;
         this.lastTargetId = -1;
@@ -1060,6 +1060,7 @@ public class KillAura extends Module {
         this.isBlocking = false;
         this.fakeBlockState = false;
         this.hitSelectPauseUntil = 0L;
+        this.lastHitTime = 0L;
         this.hitSelectFreshTarget = false;
         this.lastTargetSwitchTime = 0L;
         this.lastTargetId = -1;
