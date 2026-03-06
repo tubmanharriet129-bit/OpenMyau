@@ -69,6 +69,7 @@ public class KillAura extends Module {
     // Hit Select state
     // -------------------------------------------------------
     private long hitSelectPauseUntil = 0L;
+    private boolean hitSelectFreshTarget = false;
     long lastTargetSwitchTime = 0L; // package-private for BackTrack
     private int lastTargetId = -1;
 
@@ -159,48 +160,36 @@ public class KillAura extends Module {
      *    as the drop probability (100% = perfect timing, 0% = burst disabled).
      */
     private boolean isHitSelectPaused() {
-        if (this.target == null) return false;
+    if (this.target == null) return false;
 
-        EntityLivingBase entity = this.target.getEntity();
-        boolean canTakeDamage = entity.hurtResistantTime == 0;
+    if (this.hitSelectFreshTarget) {
+        this.hitSelectFreshTarget = false;
+        this.hitSelectPauseUntil = 0L;
+        return false;
+    }
 
-        // ── Gate 1: pause-window ────────────────────────────────────────────
-        if (this.hitSelectPause.getValue() > 0
-                && System.currentTimeMillis() < this.hitSelectPauseUntil) {
+    EntityLivingBase entity = this.target.getEntity();
+    boolean canTakeDamage = entity.hurtResistantTime == 0;
 
-            // Early-exit A: target switched recently → clear pause so the
-            //               first hit on a new target is never blocked.
-            if (this.hitSelectResetWindow.getValue() > 0
-                    && (System.currentTimeMillis() - this.lastTargetSwitchTime)
-                       <= this.hitSelectResetWindow.getValue()) {
-                this.hitSelectPauseUntil = 0L;
-                // fall through to burst gate
-
-            // Early-exit B: target's i-frames expired → hit will register,
-            //               no point delaying further.
-            } else if (canTakeDamage) {
-                this.hitSelectPauseUntil = 0L;
-                // fall through to burst gate
-
-            // Still inside the window — apply cancel rate.
-            } else {
-                int rate = this.hitSelectCancelRate.getValue();
-                if (rate >= 100) return true;
-                if (rate > 0 && (Math.random() * 100.0) < rate) return true;
-            }
-        }
-
-        // ── Gate 2: burst ───────────────────────────────────────────────────
-        // Fires independently of the pause window: as long as burst is on and
-        // the target cannot take damage, we roll the in-combat cancel chance.
-        if (this.hitSelectBurst.getValue() && !canTakeDamage) {
-            int rate = this.hitSelectCombatCancelRate.getValue();
+    if (this.hitSelectPause.getValue() > 0
+            && System.currentTimeMillis() < this.hitSelectPauseUntil) {
+        if (canTakeDamage) {
+            this.hitSelectPauseUntil = 0L;
+        } else {
+            int rate = this.hitSelectCancelRate.getValue();
             if (rate >= 100) return true;
             if (rate > 0 && (Math.random() * 100.0) < rate) return true;
         }
-
-        return false;
     }
+
+    if (this.hitSelectBurst.getValue() && !canTakeDamage) {
+        int rate = this.hitSelectCombatCancelRate.getValue();
+        if (rate >= 100) return true;
+        if (rate > 0 && (Math.random() * 100.0) < rate) return true;
+    }
+
+    return false;
+}
 
     /** Called after each successful attack to arm the pause-window timer. */
     private void armHitSelect() {
@@ -210,11 +199,12 @@ public class KillAura extends Module {
     }
 
     private void notifyTargetChanged(int newEntityId) {
-        if (newEntityId != this.lastTargetId) {
-            this.lastTargetSwitchTime = System.currentTimeMillis();
-            this.lastTargetId = newEntityId;
-        }
+    if (newEntityId != this.lastTargetId) {
+        this.lastTargetSwitchTime = System.currentTimeMillis();
+        this.lastTargetId = newEntityId;
+        this.hitSelectFreshTarget = true;
     }
+}
 
     // -------------------------------------------------------
     // Core attack
@@ -1058,6 +1048,7 @@ public class KillAura extends Module {
         this.attackDelayMS = 0L;
         this.blockTick = 0;
         this.hitSelectPauseUntil = 0L;
+        this.hitSelectFreshTarget = false;
         this.lastTargetSwitchTime = 0L;
         this.lastTargetId = -1;
     }
@@ -1069,6 +1060,7 @@ public class KillAura extends Module {
         this.isBlocking = false;
         this.fakeBlockState = false;
         this.hitSelectPauseUntil = 0L;
+        this.hitSelectFreshTarget = false;
         this.lastTargetSwitchTime = 0L;
         this.lastTargetId = -1;
     }
@@ -1167,3 +1159,4 @@ public class KillAura extends Module {
         }
     }
 }
+
