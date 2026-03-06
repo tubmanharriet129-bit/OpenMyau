@@ -497,9 +497,6 @@ public class BackTrack extends Module {
         if (pkt instanceof S18PacketEntityTeleport) {
             return ((S18PacketEntityTeleport) pkt).getEntityId() == entityId;
         }
-        if (pkt instanceof S19PacketEntityHeadLook) {
-            // 1.8.9 MCP: entity id accessor is func_149381_a()
-            int id = ((S19PacketEntityHeadLook) pkt).func_149381_a();
             Entity e = mc.theWorld.getEntityByID(id);
             return e != null && e.getEntityId() == entityId;
         }
