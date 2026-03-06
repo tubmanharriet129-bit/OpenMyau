@@ -70,9 +70,8 @@ public class KillAura extends Module {
     // -------------------------------------------------------
     private boolean hitSelectFreshTarget = false;
     private long lastHitTime = 0L;
-    private int burstHitCount = 0;
-    private long burstPauseUntil = 0L;
-    long lastTargetSwitchTime = 0L; // package-private for BackTrack
+    private long midTradePauseUntil = 0L;
+    long lastTargetSwitchTime = 0L;
     private int lastTargetId = -1;
 
     public final ModeProperty mode;
@@ -112,10 +111,19 @@ public class KillAura extends Module {
     // -------------------------------------------------------
     // Hit Select properties
     // -------------------------------------------------------
-    /** Burst mode: clicks at a consistent 8 CPS, then pauses for hitSelectBurstPause ms. */
-    public final BooleanProperty hitSelectBurst;
-    /** How long to pause after each burst of 8 hits, in ms. */
-    public final IntProperty hitSelectBurstPause;
+    /**
+     * Mid Trade: only allows clicks when the target can actually take damage
+     * (hurtResistantTime == 0). Cancels clicks otherwise to avoid slowing
+     * yourself down with unnecessary hits, letting you move faster.
+     */
+    public final BooleanProperty midTrade;
+
+    /**
+     * Controls the maximum duration the module will prevent clicks after a hit.
+     * Higher values = move faster, lower average APS.
+     * 500ms = one full i-frame window. NOT ping dependent.
+     */
+    public final IntProperty midTradePause;
 
     // -------------------------------------------------------
     // Internal helpers
@@ -128,57 +136,75 @@ public class KillAura extends Module {
     }
 
     /**
-     * Two independent gates that compose cleanly:
+     * Mid Trade gate.
      *
-     * 1. Pause-window gate — suppresses clicks for up to {@code hitSelectPause} ms
-     *    after a hit, using {@code hitSelectCancelRate} as the drop probability.
-     *    Cleared early when the target can take damage again, or when the target
-     *    was switched within the reset window.
+    /**
+     * Mid Trade gate.
      *
-     * 2. Burst gate — when {@code hitSelectBurst} is on, suppresses clicks while
-     *    the target still has i-frames, using {@code hitSelectCombatCancelRate}
-     *    as the drop probability (100% = perfect timing, 0% = burst disabled).
+     * Cycle per i-frame window (500ms):
+     *   1. Hit lands → i-frames start → pause opens for midTradePause ms.
+     *   2. During pause: all clicks suppressed.
+     *   3. Pause ends → remaining window = (500 - pauseMs) ms.
+     *      Click at hardcoded 125ms intervals (exactly 8 APS) for that window.
+     *   4. i-frames expire → fire immediately → repeat from step 1.
+     *
+     * pauseMs = 0 disables the module entirely.
+     * APS during the click window is always 7-8, never faster.
      */
     private boolean isHitSelectPaused() {
         if (this.target == null) return false;
+        if (!this.midTrade.getValue()) return false;
 
-        // Always let the first hit on a new target through immediately.
+        int pauseMs = this.midTradePause.getValue();
+
+        // 0 = module disabled
+        if (pauseMs == 0) return false;
+
+        // Always let the first hit on a new target through immediately
         if (this.hitSelectFreshTarget) {
             this.hitSelectFreshTarget = false;
-            this.burstHitCount = 0;
-            this.burstPauseUntil = 0L;
+            this.midTradePauseUntil = 0L;
             return false;
         }
 
-        if (this.hitSelectBurst.getValue()) {
-            long now = System.currentTimeMillis();
+        long now = System.currentTimeMillis();
 
-            // Post-burst pause
-            if (now < this.burstPauseUntil) return true;
+        // Pause window: suppress all clicks
+        if (now < this.midTradePauseUntil) return true;
 
-            // 8 hits fired — arm pause and reset
-            if (this.burstHitCount >= 8) {
-                this.burstPauseUntil = now + this.hitSelectBurstPause.getValue();
-                this.burstHitCount = 0;
-                return true;
+        // Past the pause — we're in the click window
+        Entity e = this.target.getEntity();
+        if (e instanceof EntityLivingBase) {
+            int hurt = ((EntityLivingBase) e).hurtResistantTime;
+
+            if (hurt > 0) {
+                // Target still in i-frames — enforce 125ms APS during click window
+                if (now - this.lastHitTime < 125L) return true;
+                // Rearm BackTrack buffer at start of each click window
+                BackTrack bt = (BackTrack) Myau.moduleManager.getModule(BackTrack.class);
+                if (bt != null && bt.isEnabled()) bt.onKillAuraResuming();
+                return false;
             }
-
-            // First hit fires immediately after pause ends
-            if (this.burstHitCount == 0) return false;
-
-            // Space remaining 7 hits evenly across the pause duration
-            // interval = pauseMs / 8  (e.g. 300ms → 37ms, 380ms → 47ms)
-            long interval = this.hitSelectBurstPause.getValue() / 8L;
-            if (now - this.lastHitTime < interval) return true;
         }
 
+        // i-frames expired — fire immediately (fresh cycle, pause will be
+        // set by armHitSelect after this hit lands)
         return false;
     }
 
-    /** Called after each successful attack to advance the burst counter. */
+    /**
+     * Called after each successful attack.
+     * Opens the pause window and notifies BackTrack to flush.
+     */
     private void armHitSelect() {
-        this.lastHitTime = System.currentTimeMillis();
-        this.burstHitCount++;
+        long now = System.currentTimeMillis();
+        this.lastHitTime = now;
+        int pauseMs = this.midTradePause.getValue();
+        if (pauseMs > 0 && this.midTrade.getValue()) {
+            this.midTradePauseUntil = now + pauseMs;
+            BackTrack bt = (BackTrack) Myau.moduleManager.getModule(BackTrack.class);
+            if (bt != null && bt.isEnabled()) bt.onKillAuraBurstComplete();
+        }
     }
 
     private void notifyTargetChanged(int newEntityId) {
@@ -186,6 +212,9 @@ public class KillAura extends Module {
             this.lastTargetSwitchTime = System.currentTimeMillis();
             this.lastTargetId = newEntityId;
             this.hitSelectFreshTarget = true;
+            // Sync BackTrack to the new target immediately
+            BackTrack bt = (BackTrack) Myau.moduleManager.getModule(BackTrack.class);
+            if (bt != null && bt.isEnabled()) bt.syncTarget(newEntityId);
         }
     }
 
@@ -427,12 +456,10 @@ public class KillAura extends Module {
         this.showTarget = new ModeProperty("show-target", 0, new String[]{"NONE", "DEFAULT", "HUD"});
         this.debugLog = new ModeProperty("debug-log", 0, new String[]{"NONE", "HEALTH"});
 
-        // ── Hit Select ────────────────────────────────────────────────────────
-        this.hitSelectBurst = new BooleanProperty("hit-select-burst", false);
-        // Pause between bursts in ms (0–500, default 300).
-        // 500ms = one full hurt time / i-frame window.
-        this.hitSelectBurstPause = new IntProperty("hit-select-burst-pause", 300, 0, 500,
-                this.hitSelectBurst::getValue);
+        // ── Mid Trade ─────────────────────────────────────────────────────────
+        this.midTrade = new BooleanProperty("mid-trade", false);
+        this.midTradePause = new IntProperty("mid-trade-pause", 300, 0, 500,
+                this.midTrade::getValue);
     }
 
     // -------------------------------------------------------
