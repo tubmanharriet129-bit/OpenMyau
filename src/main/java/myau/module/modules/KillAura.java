@@ -1045,8 +1045,7 @@ public class KillAura extends Module {
         this.blockTick = 0;
         this.hitSelectFreshTarget = false;
         this.lastHitTime = 0L;
-        this.burstHitCount = 0;
-        this.burstPauseUntil = 0L;
+        this.midTradePauseUntil = 0L;
         this.lastTargetSwitchTime = 0L;
         this.lastTargetId = -1;
     }
@@ -1059,8 +1058,7 @@ public class KillAura extends Module {
         this.fakeBlockState = false;
         this.hitSelectFreshTarget = false;
         this.lastHitTime = 0L;
-        this.burstHitCount = 0;
-        this.burstPauseUntil = 0L;
+        this.midTradePauseUntil = 0L;
         this.lastTargetSwitchTime = 0L;
         this.lastTargetId = -1;
     }
