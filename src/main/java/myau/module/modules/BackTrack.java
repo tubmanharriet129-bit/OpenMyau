@@ -280,7 +280,7 @@ public class BackTrack extends Module {
                 // midTradeResetWindow. If so, hard-release immediately
                 // so the new target's position is current from tick 1,
                 // matching KillAura's own rapid-switch bypass behaviour.
-                long msSinceSwitch = System.currentTimeMillis() - killAura.lastTargetSwitchTime;
+                long msSinceSwitch = System.currentTimeMillis() - killAura.getLastTargetSwitchTime();
                 int resetWindow    = killAura.midTradeResetWindow.getValue();
                 boolean rapidSwitch = resetWindow > 0 && msSinceSwitch <= resetWindow;
 
