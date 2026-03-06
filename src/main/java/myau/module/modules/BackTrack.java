@@ -101,7 +101,7 @@ public class BackTrack extends Module {
      * Lower = more aggressive (releases closer to i-frame expiry).
      * 2 ticks is optimal for most scenarios.
      */
-    public final IntProperty iFrameThreshold = new IntProperty("iframe-threshold", 2, 1, 5);
+    public final IntProperty iFrameThreshold = new IntProperty("iframe-threshold", 2, 1, 10);
 
     /**
      * Also flush and rearm at the peak of the target's jump.
@@ -196,6 +196,14 @@ public class BackTrack extends Module {
         Deque<Packet<?>> buf = this.getBuffer(this.targetId);
         if (buf == null || buf.isEmpty()) return;
 
+        // If the target has any vertical movement, flush immediately so their
+        // Y position is always live on our client — prevents them appearing
+        // inside the ground when buffered position differs from actual terrain.
+        if (Math.abs(target.motionY) > 0.001) {
+            this.flushAndRearm(this.targetId);
+            return;
+        }
+
         // i-frame threshold trigger — flush and rearm for double hit
         if (target.hurtResistantTime > 0
                 && target.hurtResistantTime <= this.iFrameThreshold.getValue()) {
@@ -246,7 +254,7 @@ public class BackTrack extends Module {
         // Not engaged yet — wait for first hit via onAttack
         if (!this.engaged) return;
 
-        // Buffer S14 (relative move) for the target entity only
+        // Buffer S14 (relative move) for the target entity only.
         if (packet instanceof S14PacketEntity) {
             S14PacketEntity p = (S14PacketEntity) packet;
             Entity e = p.getEntity(mc.theWorld);
@@ -257,7 +265,7 @@ public class BackTrack extends Module {
             return;
         }
 
-        // Buffer S18 (teleport) for the target entity only
+        // Buffer S18 (teleport) for the target entity only.
         if (packet instanceof S18PacketEntityTeleport) {
             S18PacketEntityTeleport p = (S18PacketEntityTeleport) packet;
             if (p.getEntityId() == this.targetId) {
