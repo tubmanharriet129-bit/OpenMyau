@@ -137,7 +137,7 @@ public class KillAura extends Module {
 
     /**
      * Mid Trade gate.
-     *
+     */
     private boolean isHitSelectPaused() {
         if (this.target == null) return false;
         if (!this.midTrade.getValue()) return false;
