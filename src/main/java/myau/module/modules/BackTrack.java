@@ -18,131 +18,86 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityLivingBase;
 import net.minecraft.entity.player.EntityPlayer;
-import net.minecraft.network.Packet;
-import net.minecraft.network.play.server.S08PacketPlayerPosLook;
-import net.minecraft.network.play.server.S14PacketEntity;
-import net.minecraft.network.play.server.S18PacketEntityTeleport;
-import net.minecraft.network.play.server.S19PacketEntityStatus;
 import net.minecraft.network.play.client.C02PacketUseEntity;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
 import net.minecraft.util.AxisAlignedBB;
 
 import java.awt.*;
 import java.util.ArrayDeque;
 import java.util.Deque;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * BackTrack — Slinky-style inbound position buffer.
+ * BackTrack — XZ-only position snapshot desync.
  *
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║  INBOUND  — target entity position packets are buffered.               ║
- * ║  Their position on your client is frozen at a recent snapshot          ║
- * ║  while their real server-side position advances.                       ║
+ * ║  NO packets are ever cancelled or buffered.                            ║
+ * ║  Entity position packets all process normally — Y is always live.      ║
  * ║                                                                        ║
- * ║  OUTBOUND — YOUR packets are NEVER touched. Your movement, attacks,    ║
- * ║  and animations all go out immediately with zero delay.                ║
+ * ║  Instead, each tick we manually override the target entity's posX/posZ ║
+ * ║  to an older snapshot, while posY is always the real current value.    ║
+ * ║  KillAura attacks the overridden XZ position.                          ║
+ * ║  Your own movement is completely untouched.                            ║
  * ╚══════════════════════════════════════════════════════════════════════════╝
  *
- * How the desync works:
- *   The server knows the enemy is at position X (present).
- *   Your client thinks the enemy is at position X - N ticks (buffered).
- *   KillAura attacks the frozen position.
- *   The server validates the attack against its own known positions and
- *   accepts it because it was in range at the time the packet was sent.
+ * Why this fixes the visual glitch:
+ *   Previous approach cancelled S14/S18 packets entirely, which froze Y too.
+ *   Jumping targets appeared underground; targets on slopes appeared floating.
+ *   This approach never touches packets — Y updates normally every tick,
+ *   only XZ is rewound to an older snapshot.
  *
- * This is fundamentally different from outbound lag:
- *   Outbound lag  → holds YOUR packets, delaying your own movement.
- *   Slinky        → holds THEIR packets, your movement is always live.
+ * Desync mechanism:
+ *   Every tick we record the entity's real (posX, posZ).
+ *   We then set entity.posX/posZ to the snapshot from delayMs ago.
+ *   The server knows where they actually are. Your C02 attack packet
+ *   references the overridden (older) XZ position, giving effective reach.
+ *   After the tick, we restore real posX/posZ so nothing else breaks.
  *
  * Double-hit cycle:
- *   The buffer is flushed when the target's i-frames are about to expire
- *   (hurtResistantTime <= iFrameThreshold). The instant flush causes their
- *   client-side position to snap to the real position. KillAura's next hit
- *   then fires at the freshly updated (real) position — producing a double
- *   hit in rapid succession. The buffer immediately rearms for the next cycle.
- *
- * Buffer contents (inbound, target entity only):
- *   S14PacketEntity          — relative position update
- *   S18PacketEntityTeleport  — absolute position update
- *
- * Never buffered (all other inbound passes through instantly):
- *   S08 teleport (us)        — always processed immediately
- *   S19 entity status        — always processed (hurt events, death, etc)
- *   All other packets        — untouched
- *
- * Flush triggers:
- *   1. i-frame threshold reached → flushAndRearm() (double-hit cycle)
- *   2. Jump peak detected         → flushAndRearm()
- *   3. delayMs timer expired      → flush() + rearm
- *   4. Target out of range        → dropBuffer()
- *   5. S08 teleport (us)          → dropBuffer() (safety)
- *   6. Module disabled            → flush()
+ *   When hurtResistantTime <= iFrameThreshold, we stop overriding XZ —
+ *   entity snaps to real position, KillAura fires at the real position
+ *   as i-frames expire. Buffer immediately rearms for the next cycle.
  */
 public class BackTrack extends Module {
     private static final Minecraft mc = Minecraft.getMinecraft();
 
     // ── Settings ──────────────────────────────────────────────────────────
 
-    /**
-     * How many ms to buffer the target's position packets.
-     * This is the desync window — higher = target is more frozen.
-     * Capped at 150ms (Hypixel threshold).
-     */
     public final IntProperty delayMs = new IntProperty("hold-time", 100, 20, 150);
-
     public final FloatProperty minDistance = new FloatProperty("min-dist", 1.0f, 0.5f, 4.0f);
     public final FloatProperty maxDistance = new FloatProperty("max-dist", 4.0f, 1.0f, 6.0f);
-
-    /**
-     * i-frame threshold for the double-hit trigger.
-     * Flush and rearm when hurtResistantTime <= this value.
-     * Lower = more aggressive (releases closer to i-frame expiry).
-     * 2 ticks is optimal for most scenarios.
-     */
     public final IntProperty iFrameThreshold = new IntProperty("iframe-threshold", 2, 1, 10);
-
-    /**
-     * Also flush and rearm at the peak of the target's jump.
-     * The frozen position is below the apex — hit 1 lands at the lower
-     * frozen pos, flush snaps them to peak, hit 2 lands at apex.
-     */
     public final BooleanProperty jumpPeak = new BooleanProperty("jump-peak", true);
-
-    /** Whether to drop the buffer when the server teleports us. */
-    public final BooleanProperty flushOnTeleport = new BooleanProperty("flush-on-tp", true);
-
     public final ModeProperty showPosition = new ModeProperty("show-position", 1,
             new String[]{"NONE", "DEFAULT", "HUD"});
 
-    // ── Constants ─────────────────────────────────────────────────────────
+    // ── Snapshot record ───────────────────────────────────────────────────
 
-    private static final int MAX_BUFFER_DEPTH = 64;
+    private static final class Snapshot {
+        final double x, z;
+        final long timestamp;
+        Snapshot(double x, double z, long ts) { this.x = x; this.z = z; this.timestamp = ts; }
+    }
 
     // ── State ─────────────────────────────────────────────────────────────
 
-    /**
-     * Per-entity inbound position packet buffer.
-     * Key = entity ID. Only the current target is actively buffered.
-     * Other entities are not touched.
-     */
-    private final Map<Integer, Deque<Packet<?>>> inboundBuffers = new HashMap<>();
-    private final ReentrantLock bufferLock = new ReentrantLock();
+    /** Circular buffer of XZ snapshots for the target. */
+    private final Deque<Snapshot> snapshots = new ArrayDeque<>();
 
-    /** True while we're draining a buffer — prevents re-entrancy. */
-    private volatile boolean draining = false;
+    /** True while we are actively overriding the entity's XZ position. */
+    private boolean active = false;
 
-    /** Current target entity ID being buffered. -1 = no target. */
+    /** The entity ID we are currently tracking. -1 = none. */
     private int targetId = -1;
 
-    /** Whether the first hit has landed (arming condition). */
+    /** Whether the first hit has been detected. */
     private boolean engaged = false;
 
-    /** Wall-clock ms when buffering started for this cycle. */
-    private long bufferStart = 0L;
+    /** Real posX/posZ saved before override so we can restore after. */
+    private double realX, realZ;
+    private double prevRealX, prevRealZ;
+    private double lastTickRealX, lastTickRealZ;
 
-    /** Y position tracking for jump peak detection. */
+    /** Jump peak tracking. */
     private double prevTargetY  = 0.0;
     private double prevTargetDy = 0.0;
     private boolean prevYTracked = false;
@@ -160,301 +115,206 @@ public class BackTrack extends Module {
 
     @Override
     public void onDisabled() {
-        this.flushAll();
+        this.restorePosition();
         this.resetState();
     }
 
-    // ── Per-tick update ───────────────────────────────────────────────────
+    // ── Per-tick: record snapshot and apply override ───────────────────────
 
     @EventTarget
     public void onTick(TickEvent event) {
-        if (!this.isEnabled() || !this.engaged || mc.thePlayer == null) return;
+        if (!this.isEnabled() || mc.thePlayer == null || mc.theWorld == null) return;
         if (event.getType() != EventType.PRE) return;
 
-        EntityLivingBase target = this.getCurrentTarget();
+        // Restore real position from last tick before doing anything else
+        this.restorePosition();
 
-        // Target gone or out of range — drop buffer
+        if (!this.engaged) return;
+
+        EntityLivingBase target = this.getCurrentTarget();
         if (target == null) {
-            this.dropBuffer(this.targetId);
             this.resetState();
             return;
         }
 
         double dist = mc.thePlayer.getDistanceToEntity(target);
         if (dist < this.minDistance.getValue() || dist > this.maxDistance.getValue()) {
-            this.dropBuffer(this.targetId);
             this.resetState();
             return;
         }
 
-        // Hard time cap
-        if (System.currentTimeMillis() - this.bufferStart >= this.delayMs.getValue()) {
-            this.flushAndRearm(this.targetId);
-            return;
-        }
+        long now = System.currentTimeMillis();
 
-        Deque<Packet<?>> buf = this.getBuffer(this.targetId);
-        if (buf == null || buf.isEmpty()) return;
+        // Record real XZ snapshot this tick
+        this.snapshots.addLast(new Snapshot(target.posX, target.posZ, now));
 
-        // If the target has any vertical movement, flush immediately so their
-        // Y position is always live on our client — prevents them appearing
-        // inside the ground when buffered position differs from actual terrain.
-        if (Math.abs(target.motionY) > 0.001) {
-            this.flushAndRearm(this.targetId);
-            return;
-        }
+        // Trim snapshots older than delayMs * 2 to prevent unbounded growth
+        while (this.snapshots.size() > 64) this.snapshots.pollFirst();
 
-        // i-frame threshold trigger — flush and rearm for double hit
+        // Double-hit triggers — stop overriding so entity snaps to real pos
+        boolean shouldOverride = true;
+
         if (target.hurtResistantTime > 0
                 && target.hurtResistantTime <= this.iFrameThreshold.getValue()) {
-            this.flushAndRearm(this.targetId);
-            return;
+            // i-frame threshold: let entity snap to real position for double hit
+            shouldOverride = false;
         }
 
-        // Jump peak trigger
         if (this.jumpPeak.getValue() && this.prevYTracked) {
             double curDy = target.posY - this.prevTargetY;
             if (this.prevTargetDy > 0.01 && curDy <= 0.01) {
-                this.flushAndRearm(this.targetId);
-                this.updatePrevY(target);
-                return;
+                shouldOverride = false; // jump peak: snap for double hit
             }
         }
 
         this.updatePrevY(target);
+
+        if (!shouldOverride) {
+            this.active = false;
+            this.snapshots.clear(); // rearm: start fresh snapshot buffer
+            return;
+        }
+
+        // Find the snapshot that is closest to delayMs ago
+        Snapshot delayed = null;
+        for (Snapshot s : this.snapshots) {
+            if (now - s.timestamp >= this.delayMs.getValue()) {
+                delayed = s;
+            } else {
+                break;
+            }
+        }
+
+        if (delayed == null) {
+            // Not enough history yet — no override
+            this.active = false;
+            return;
+        }
+
+        // Save real position so we can restore it next tick
+        this.realX          = target.posX;
+        this.realZ          = target.posZ;
+        this.prevRealX      = target.prevPosX;
+        this.prevRealZ      = target.prevPosZ;
+        this.lastTickRealX  = target.lastTickPosX;
+        this.lastTickRealZ  = target.lastTickPosZ;
+
+        // Override entity XZ to the delayed snapshot — Y is untouched
+        target.posX         = delayed.x;
+        target.posZ         = delayed.z;
+        target.prevPosX     = delayed.x;
+        target.prevPosZ     = delayed.z;
+        target.lastTickPosX = delayed.x;
+        target.lastTickPosZ = delayed.z;
+
+        // Update bounding box so hit detection uses overridden position
+        target.setEntityBoundingBox(target.getEntityBoundingBox()
+                .offset(delayed.x - this.realX, 0, delayed.z - this.realZ));
+
+        this.active = true;
     }
 
-    // ── Packet handler ────────────────────────────────────────────────────
+    // ── Restore position after each tick ─────────────────────────────────
+
+    /**
+     * Restores the entity's real XZ position after each tick.
+     * Called at the top of every onTick so the override only persists
+     * for exactly one tick — preventing permanent position corruption.
+     */
+    private void restorePosition() {
+        if (!this.active) return;
+        EntityLivingBase target = this.getCurrentTarget();
+        if (target == null) { this.active = false; return; }
+
+        double dx = this.realX - target.posX;
+        double dz = this.realZ - target.posZ;
+
+        target.posX         = this.realX;
+        target.posZ         = this.realZ;
+        target.prevPosX     = this.prevRealX;
+        target.prevPosZ     = this.prevRealZ;
+        target.lastTickPosX = this.lastTickRealX;
+        target.lastTickPosZ = this.lastTickRealZ;
+
+        // Restore bounding box
+        target.setEntityBoundingBox(target.getEntityBoundingBox()
+                .offset(dx, 0, dz));
+
+        this.active = false;
+    }
+
+    // ── Packet handler — only for engagement detection ────────────────────
 
     @EventTarget
     public void onPacket(PacketEvent event) {
-        if (!this.isEnabled() || mc.thePlayer == null || mc.theWorld == null) return;
+        if (!this.isEnabled() || mc.thePlayer == null) return;
 
-        // Outbound: detect attacks to arm engagement — YOUR movement is never touched
-        if (event.getType() == EventType.SEND) {
-            this.handleOutboundAttack(event.getPacket());
-            return; // never cancel outbound
-        }
-
-        // Only intercept inbound packets beyond this point
-        if (event.getType() != EventType.RECEIVE) return;
-        // YOUR outbound packets are NEVER touched — no outbound handling at all
-
-        Packet<?> packet = event.getPacket();
-
-        // S08 — server teleporting us: drop buffer immediately for safety
-        if (packet instanceof S08PacketPlayerPosLook) {
-            if (this.flushOnTeleport.getValue()) {
-                this.dropBuffer(this.targetId);
-                this.resetState();
-            }
+        // S08 teleport (us): reset engagement
+        if (event.getType() == EventType.RECEIVE
+                && event.getPacket() instanceof S08PacketPlayerPosLook) {
+            this.restorePosition();
+            this.resetState();
             return;
         }
 
-        // Not engaged yet — wait for first hit via onAttack
-        if (!this.engaged) return;
+        // Outbound C02 attack: detect engagement and target
+        if (event.getType() == EventType.SEND
+                && event.getPacket() instanceof C02PacketUseEntity) {
+            C02PacketUseEntity use = (C02PacketUseEntity) event.getPacket();
+            if (use.getAction() != C02PacketUseEntity.Action.ATTACK) return;
+            Entity entity = use.getEntityFromWorld(mc.theWorld);
+            if (!(entity instanceof EntityLivingBase)) return;
+            double dist = mc.thePlayer.getDistanceToEntity(entity);
+            if (dist < this.minDistance.getValue() || dist > this.maxDistance.getValue()) return;
 
-        // Buffer S14 (relative move) for the target entity only.
-        if (packet instanceof S14PacketEntity) {
-            S14PacketEntity p = (S14PacketEntity) packet;
-            Entity e = p.getEntity(mc.theWorld);
-            if (e != null && e.getEntityId() == this.targetId) {
-                this.bufferPacket(this.targetId, packet);
-                event.setCancelled(true);
+            int id = entity.getEntityId();
+            if (!this.engaged || this.targetId != id) {
+                if (this.targetId != -1 && this.targetId != id) {
+                    this.restorePosition();
+                    this.snapshots.clear();
+                }
+                this.targetId     = id;
+                this.engaged      = true;
+                this.prevYTracked = false;
             }
-            return;
         }
-
-        // Buffer S18 (teleport) for the target entity only.
-        if (packet instanceof S18PacketEntityTeleport) {
-            S18PacketEntityTeleport p = (S18PacketEntityTeleport) packet;
-            if (p.getEntityId() == this.targetId) {
-                this.bufferPacket(this.targetId, packet);
-                event.setCancelled(true);
-            }
-            return;
-        }
-
-        // S19 — entity status (hurt, death, etc): never buffered, always live
-        // All other inbound: untouched
     }
 
     // ── KillAura sync API ─────────────────────────────────────────────────
 
     /**
-     * Called by KillAura when its burst of 8 hits completes and the pause begins.
-     * Flush the buffer immediately so the enemy snaps to their real position
-     * during the pause window — KillAura's first hit after the pause lands
-     * at the freshly updated real position.
+     * Called by KillAura when its burst completes and pause begins.
+     * Stop overriding so entity snaps to real position during pause.
      */
     public void onKillAuraBurstComplete() {
-        if (!this.isEnabled() || !this.engaged) return;
-        this.drainAndProcess(this.targetId);
-        // Do NOT rearm — let the enemy stay at real position during pause
+        if (!this.isEnabled()) return;
+        this.restorePosition();
+        this.snapshots.clear();
+        this.active = false;
     }
 
     /**
-     * Called by KillAura when its pause ends and the next burst is about to start.
-     * Rearm the buffer so the burst fires at a frozen position again.
+     * Called by KillAura when its pause ends and burst resumes.
+     * Snapshots will start accumulating again in the next onTick.
      */
     public void onKillAuraResuming() {
-        if (!this.isEnabled() || !this.engaged) return;
-        this.bufferStart = System.currentTimeMillis();
+        if (!this.isEnabled()) return;
+        this.snapshots.clear(); // fresh window for new burst
     }
 
     /**
      * Called by KillAura when it switches to a new target.
-     * Flush the old target's buffer and sync to the new entity ID.
      */
     public void syncTarget(int entityId) {
         if (!this.isEnabled()) return;
-        if (this.targetId != -1 && this.targetId != entityId) {
-            this.flushAll();
+        if (this.targetId != entityId) {
+            this.restorePosition();
+            this.snapshots.clear();
+            this.active = false;
         }
         this.targetId     = entityId;
         this.engaged      = true;
-        this.bufferStart  = System.currentTimeMillis();
         this.prevYTracked = false;
-    }
-
-    // ── Attack detection — arm on first outbound C02 attack ──────────────
-
-    private void handleOutboundAttack(Packet<?> packet) {
-        if (!(packet instanceof C02PacketUseEntity)) return;
-        C02PacketUseEntity use = (C02PacketUseEntity) packet;
-        if (use.getAction() != C02PacketUseEntity.Action.ATTACK) return;
-
-        Entity entity = use.getEntityFromWorld(mc.theWorld);
-        if (!(entity instanceof EntityLivingBase)) return;
-
-        double dist = mc.thePlayer.getDistanceToEntity(entity);
-        if (dist < this.minDistance.getValue() || dist > this.maxDistance.getValue()) return;
-
-        int id = entity.getEntityId();
-
-        if (!this.engaged || this.targetId != id) {
-            // New target or first engagement — flush old buffer if switching
-            if (this.targetId != -1 && this.targetId != id) {
-                this.flushAll();
-            }
-            this.targetId     = id;
-            this.engaged      = true;
-            this.bufferStart  = System.currentTimeMillis();
-            this.prevYTracked = false;
-        } else {
-            // Already engaged — rearm if buffer drained
-            Deque<Packet<?>> buf = this.getBuffer(id);
-            if (buf == null || buf.isEmpty()) {
-                this.bufferStart = System.currentTimeMillis();
-            }
-        }
-    }
-
-    // ── Attack hook — arm on first hit ────────────────────────────────────
-
-    // ── Buffer helpers ────────────────────────────────────────────────────
-
-    private void bufferPacket(int entityId, Packet<?> packet) {
-        this.bufferLock.lock();
-        try {
-            Deque<Packet<?>> buf = this.inboundBuffers.computeIfAbsent(
-                    entityId, k -> new ArrayDeque<>());
-            if (buf.size() >= MAX_BUFFER_DEPTH) {
-                // Buffer full — flush oldest packet immediately to prevent stale buildup
-                Packet<?> oldest = buf.pollFirst();
-                if (oldest != null && mc.getNetHandler() != null) {
-                    //noinspection unchecked,rawtypes
-                    ((Packet) oldest).processPacket(mc.getNetHandler());
-                }
-            }
-            buf.addLast(packet);
-        } finally {
-            this.bufferLock.unlock();
-        }
-    }
-
-    /**
-     * Flushes the buffer for an entity and immediately rearms.
-     * This produces the double-hit: frozen position snap → KillAura
-     * fires at the new real position within the same i-frame window.
-     */
-    private void flushAndRearm(int entityId) {
-        this.drainAndProcess(entityId);
-        // Rearm immediately for next cycle
-        this.bufferStart = System.currentTimeMillis();
-    }
-
-    /** Flushes all buffers without rearming. Used on disable/target loss. */
-    private void flushAll() {
-        if (this.draining) return;
-        this.draining = true;
-        try {
-            this.bufferLock.lock();
-            try {
-                for (Map.Entry<Integer, Deque<Packet<?>>> entry
-                        : this.inboundBuffers.entrySet()) {
-                    this.processDeque(entry.getValue());
-                }
-                this.inboundBuffers.clear();
-            } finally {
-                this.bufferLock.unlock();
-            }
-        } finally {
-            this.draining = false;
-        }
-    }
-
-    /** Drops (discards) the buffer for an entity without processing. */
-    private void dropBuffer(int entityId) {
-        this.bufferLock.lock();
-        try {
-            this.inboundBuffers.remove(entityId);
-        } finally {
-            this.bufferLock.unlock();
-        }
-    }
-
-    /** Drains the buffer for an entity and processes all held packets. */
-    private void drainAndProcess(int entityId) {
-        if (this.draining) return;
-        this.draining = true;
-        try {
-            Deque<Packet<?>> snapshot = null;
-            this.bufferLock.lock();
-            try {
-                Deque<Packet<?>> buf = this.inboundBuffers.get(entityId);
-                if (buf != null && !buf.isEmpty()) {
-                    snapshot = new ArrayDeque<>(buf);
-                    buf.clear();
-                }
-            } finally {
-                this.bufferLock.unlock();
-            }
-            if (snapshot != null) this.processDeque(snapshot);
-        } finally {
-            this.draining = false;
-        }
-    }
-
-    @SuppressWarnings({"unchecked", "rawtypes"})
-    private void processDeque(Deque<Packet<?>> deque) {
-        if (mc.getNetHandler() == null) return;
-        for (Packet<?> p : deque) {
-            try {
-                ((Packet) p).processPacket(mc.getNetHandler());
-            } catch (Exception ignored) {
-                // Stale packet — skip
-            }
-        }
-    }
-
-    private Deque<Packet<?>> getBuffer(int entityId) {
-        this.bufferLock.lock();
-        try {
-            return this.inboundBuffers.get(entityId);
-        } finally {
-            this.bufferLock.unlock();
-        }
     }
 
     // ── Utility ───────────────────────────────────────────────────────────
@@ -476,14 +336,12 @@ public class BackTrack extends Module {
     }
 
     private void resetState() {
+        this.restorePosition();
+        this.snapshots.clear();
+        this.active       = false;
         this.engaged      = false;
         this.targetId     = -1;
-        this.bufferStart  = 0L;
         this.prevYTracked = false;
-        this.draining     = false;
-        this.bufferLock.lock();
-        try { this.inboundBuffers.clear(); }
-        finally { this.bufferLock.unlock(); }
     }
 
     // ── Render ────────────────────────────────────────────────────────────
@@ -491,7 +349,6 @@ public class BackTrack extends Module {
     @EventTarget
     public void onRender3D(Render3DEvent event) {
         if (!this.isEnabled() || this.showPosition.getValue() == 0) return;
-
         EntityLivingBase target = this.getCurrentTarget();
         if (target == null) return;
 
@@ -506,8 +363,7 @@ public class BackTrack extends Module {
                 color = ((HUD) Myau.moduleManager.modules.get(HUD.class))
                         .getColor(System.currentTimeMillis());
                 break;
-            default:
-                return;
+            default: return;
         }
 
         float size = target.getCollisionBorderSize();
