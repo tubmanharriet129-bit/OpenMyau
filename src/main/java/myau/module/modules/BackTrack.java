@@ -23,6 +23,7 @@ import net.minecraft.network.play.server.S08PacketPlayerPosLook;
 import net.minecraft.network.play.server.S14PacketEntity;
 import net.minecraft.network.play.server.S18PacketEntityTeleport;
 import net.minecraft.network.play.server.S19PacketEntityStatus;
+import net.minecraft.network.play.client.C02PacketUseEntity;
 import net.minecraft.util.AxisAlignedBB;
 
 import java.awt.*;
@@ -262,6 +263,39 @@ public class BackTrack extends Module {
 
         // S19 — entity status (hurt, death, etc): never buffered, always live
         // All other inbound: untouched
+    }
+
+    // ── Attack detection — arm on first outbound C02 attack ──────────────
+
+    private void handleOutboundAttack(Packet<?> packet) {
+        if (!(packet instanceof C02PacketUseEntity)) return;
+        C02PacketUseEntity use = (C02PacketUseEntity) packet;
+        if (use.getAction() != C02PacketUseEntity.Action.ATTACK) return;
+
+        Entity entity = use.getEntityFromWorld(mc.theWorld);
+        if (!(entity instanceof EntityLivingBase)) return;
+
+        double dist = mc.thePlayer.getDistanceToEntity(entity);
+        if (dist < this.minDistance.getValue() || dist > this.maxDistance.getValue()) return;
+
+        int id = entity.getEntityId();
+
+        if (!this.engaged || this.targetId != id) {
+            // New target or first engagement — flush old buffer if switching
+            if (this.targetId != -1 && this.targetId != id) {
+                this.flushAll();
+            }
+            this.targetId     = id;
+            this.engaged      = true;
+            this.bufferStart  = System.currentTimeMillis();
+            this.prevYTracked = false;
+        } else {
+            // Already engaged — rearm if buffer drained
+            Deque<Packet<?>> buf = this.getBuffer(id);
+            if (buf == null || buf.isEmpty()) {
+                this.bufferStart = System.currentTimeMillis();
+            }
+        }
     }
 
     // ── Attack hook — arm on first hit ────────────────────────────────────
