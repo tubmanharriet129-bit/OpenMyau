@@ -69,8 +69,8 @@ public class KillAura extends Module {
     // Hit Select state
     // -------------------------------------------------------
     private long hitSelectPauseUntil = 0L;
-    private long lastHitTime = 0L;
     private boolean hitSelectFreshTarget = false;
+    private long lastHitTime = 0L;
     long lastTargetSwitchTime = 0L; // package-private for BackTrack
     private int lastTargetId = -1;
 
@@ -161,49 +161,55 @@ public class KillAura extends Module {
      *    as the drop probability (100% = perfect timing, 0% = burst disabled).
      */
     private boolean isHitSelectPaused() {
-    if (this.target == null) return false;
+        if (this.target == null) return false;
 
-    if (this.hitSelectFreshTarget) {
-        this.hitSelectFreshTarget = false;
-        this.hitSelectPauseUntil = 0L;
-        return false;
-    }
-
-    EntityLivingBase entity = this.target.getEntity();
-    boolean canTakeDamage = entity.hurtResistantTime == 0;
-
-    if (this.hitSelectPause.getValue() > 0
-            && System.currentTimeMillis() < this.hitSelectPauseUntil) {
-        if (entity.hurtResistantTime == 0) {
+        // Always let the first hit on a new target through unconditionally.
+        if (this.hitSelectFreshTarget) {
+            this.hitSelectFreshTarget = false;
             this.hitSelectPauseUntil = 0L;
-        } else {
-            int rate = this.hitSelectCancelRate.getValue();
+            return false;
+        }
+
+        EntityLivingBase entity = this.target.getEntity();
+
+        // Gate 1: pause-window (time-based, ping-independent)
+        if (this.hitSelectPause.getValue() > 0
+                && System.currentTimeMillis() < this.hitSelectPauseUntil) {
+            if (entity.hurtResistantTime == 0) {
+                this.hitSelectPauseUntil = 0L;
+            } else {
+                int rate = this.hitSelectCancelRate.getValue();
+                if (rate >= 100) return true;
+                if (rate > 0 && (Math.random() * 100.0) < rate) return true;
+            }
+        }
+
+        // Gate 2: burst (local clock only, fully ping-independent)
+        boolean localIframes = (System.currentTimeMillis() - this.lastHitTime) < 500L;
+        if (this.hitSelectBurst.getValue() && localIframes) {
+            int rate = this.hitSelectCombatCancelRate.getValue();
             if (rate >= 100) return true;
             if (rate > 0 && (Math.random() * 100.0) < rate) return true;
         }
+
+        return false;
     }
-
-boolean localIframes = (System.currentTimeMillis() - this.lastHitTime) < 500L;
-if (this.hitSelectBurst.getValue() && localIframes) {
-
-    return false;
-}
 
     /** Called after each successful attack to arm the pause-window timer. */
-private void armHitSelect() {
-    if (this.hitSelectPause.getValue() > 0) {
-        this.hitSelectPauseUntil = System.currentTimeMillis() + this.hitSelectPause.getValue();
+    private void armHitSelect() {
+        if (this.hitSelectPause.getValue() > 0) {
+            this.hitSelectPauseUntil = System.currentTimeMillis() + this.hitSelectPause.getValue();
+        }
+        this.lastHitTime = System.currentTimeMillis();
     }
-    this.lastHitTime = System.currentTimeMillis();
-}
 
     private void notifyTargetChanged(int newEntityId) {
-    if (newEntityId != this.lastTargetId) {
-        this.lastTargetSwitchTime = System.currentTimeMillis();
-        this.lastTargetId = newEntityId;
-        this.hitSelectFreshTarget = true;
+        if (newEntityId != this.lastTargetId) {
+            this.lastTargetSwitchTime = System.currentTimeMillis();
+            this.lastTargetId = newEntityId;
+            this.hitSelectFreshTarget = true;
+        }
     }
-}
 
     // -------------------------------------------------------
     // Core attack
@@ -1047,8 +1053,8 @@ private void armHitSelect() {
         this.attackDelayMS = 0L;
         this.blockTick = 0;
         this.hitSelectPauseUntil = 0L;
-        this.lastHitTime = 0L;
         this.hitSelectFreshTarget = false;
+        this.lastHitTime = 0L;
         this.lastTargetSwitchTime = 0L;
         this.lastTargetId = -1;
     }
@@ -1060,8 +1066,8 @@ private void armHitSelect() {
         this.isBlocking = false;
         this.fakeBlockState = false;
         this.hitSelectPauseUntil = 0L;
-        this.lastHitTime = 0L;
         this.hitSelectFreshTarget = false;
+        this.lastHitTime = 0L;
         this.lastTargetSwitchTime = 0L;
         this.lastTargetId = -1;
     }
@@ -1160,4 +1166,3 @@ private void armHitSelect() {
         }
     }
 }
-
