@@ -25,6 +25,7 @@ import net.minecraft.network.play.server.S18PacketEntityTeleport;
 import net.minecraft.util.AxisAlignedBB;
 import net.minecraft.util.Vec3;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.Map;
@@ -38,38 +39,27 @@ public class BackTrack extends Module {
     // Properties
     // ─────────────────────────────────────────────────────────────
 
-    /** Artificial lag in ms added to outgoing packets. */
     public final IntProperty delay =
             new IntProperty("delay", 50, 10, 300);
 
-    /**
-     * Maximum hurtResistantTime (ms) the target may have for the lag to apply.
-     * 500 = always lag. Lower = burst only near the damage window.
-     */
     public final IntProperty maxHurtTime =
             new IntProperty("max-hurt-time", 500, 0, 500);
 
-    /** Distance above which BackTrack activates. */
     public final FloatProperty maxRange =
             new FloatProperty("max-range", 4.0f, 2.0f, 10.0f);
 
-    /** Distance below which BackTrack deactivates (target already close). */
     public final FloatProperty minRange =
             new FloatProperty("min-range", 2.0f, 0.0f, 6.0f);
 
-    /** Also delay C03PacketPlayer (movement). false = attacks only. */
     public final BooleanProperty delayMovement =
             new BooleanProperty("delay-movement", true);
 
-    /** Immediately flush queue if the player receives knockback. */
     public final BooleanProperty flushOnHit =
             new BooleanProperty("flush-on-hit", true);
 
-    /** Safety cap: flush everything after this many ms regardless. */
     public final IntProperty maxDelayCap =
             new IntProperty("max-delay-cap", 400, 50, 1000);
 
-    /** Render the server-side hitbox of the target while lagging. */
     public final BooleanProperty esp =
             new BooleanProperty("esp", true);
 
@@ -80,15 +70,17 @@ public class BackTrack extends Module {
     // Internal state
     // ─────────────────────────────────────────────────────────────
 
-    /** Queued outgoing packets waiting to be released after their delay. */
     private final Queue<TimedPacket> outboundQueue = new LinkedList<>();
-
-    /** Tracks interpolated server-side positions from incoming move packets. */
     private final Map<Integer, Vec3> serverPositions = new HashMap<>();
 
-    /** Timestamp (ms) when the current hold started. -1 = not holding. */
-    private long holdStart = -1L;
+    /**
+     * TRUE while we are calling sendImmediate().
+     * Prevents the SEND packet event from re-intercepting packets we are
+     * actively releasing — the root cause of the post-hit crash.
+     */
+    private boolean releasing = false;
 
+    private long holdStart = -1L;
     private boolean holding = false;
     private EntityLivingBase target = null;
     private KillAura killAura = null;
@@ -121,6 +113,7 @@ public class BackTrack extends Module {
         outboundQueue.clear();
         serverPositions.clear();
         holding = false;
+        releasing = false;
         holdStart = -1L;
         target = null;
     }
@@ -162,7 +155,11 @@ public class BackTrack extends Module {
             return;
         }
 
-        // ── Outgoing: queue if currently holding ──
+        // ── Outgoing: skip entirely if we are the ones sending ──
+        // Without this guard, sendImmediate() re-fires this event,
+        // re-queues the packet, and causes infinite recursion / CME crash.
+        if (releasing) return;
+
         if (event.getType() != EventType.SEND) return;
         if (!holding) return;
 
@@ -204,10 +201,10 @@ public class BackTrack extends Module {
             return;
         }
 
-        // Flush on knockback.
+        // Flush on knockback received.
         if (flushOnHit.getValue()
-                && mc.thePlayer.hurtTime == mc.thePlayer.maxHurtTime
-                && mc.thePlayer.maxHurtTime > 0) {
+                && mc.thePlayer.hurtTime > 0
+                && mc.thePlayer.hurtTime == mc.thePlayer.maxHurtTime) {
             if (holding) stopHolding();
             return;
         }
@@ -249,20 +246,41 @@ public class BackTrack extends Module {
         long now = System.currentTimeMillis();
         int delayMs = delay.getValue();
 
+        // Collect expired packets into a separate list first to avoid
+        // any chance of queue mutation while iterating (extra safety).
+        ArrayList<TimedPacket> toSend = new ArrayList<>();
         while (!outboundQueue.isEmpty()) {
             TimedPacket head = outboundQueue.peek();
             if (now - head.timestamp >= delayMs) {
-                outboundQueue.poll();
-                sendImmediate(head.packet);
+                toSend.add(outboundQueue.poll());
             } else {
                 break;
             }
         }
+
+        releasing = true;
+        try {
+            for (TimedPacket tp : toSend) {
+                sendImmediate(tp.packet);
+            }
+        } finally {
+            // Always clear the flag even if something throws,
+            // so the module doesn't get permanently stuck ignoring packets.
+            releasing = false;
+        }
     }
 
     private void flush() {
-        while (!outboundQueue.isEmpty()) {
-            sendImmediate(outboundQueue.poll().packet);
+        ArrayList<TimedPacket> toSend = new ArrayList<>(outboundQueue);
+        outboundQueue.clear();
+
+        releasing = true;
+        try {
+            for (TimedPacket tp : toSend) {
+                sendImmediate(tp.packet);
+            }
+        } finally {
+            releasing = false;
         }
     }
 
