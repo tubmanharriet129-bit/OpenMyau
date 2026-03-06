@@ -208,12 +208,15 @@ public class KillAura extends Module {
         if (!Myau.playerStateManager.digging && !Myau.playerStateManager.placing) {
             if (this.isPlayerBlocking() && this.autoBlock.getValue() != 1) {
                 return false;
-            } else if (this.attackDelayMS > 0L) {
+            } else if (this.attackDelayMS > 0L && !this.midTrade.getValue()) {
+                // CPS timer bypassed when midTrade is active — midTrade owns timing
                 return false;
             } else if (this.isHitSelectPaused()) {
                 return false;
             } else {
-                this.attackDelayMS = this.attackDelayMS + this.getAttackDelay();
+                if (!this.midTrade.getValue()) {
+                    this.attackDelayMS = this.attackDelayMS + this.getAttackDelay();
+                }
                 mc.thePlayer.swingItem();
                 if ((this.rotations.getValue() != 0 || !this.isBoxInAttackRange(this.target.getBox()))
                         && RotationUtil.rayTrace(this.target.getBox(), yaw, pitch, this.attackRange.getValue()) == null) {
