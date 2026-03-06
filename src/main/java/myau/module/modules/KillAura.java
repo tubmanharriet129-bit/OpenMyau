@@ -138,26 +138,11 @@ public class KillAura extends Module {
     /**
      * Mid Trade gate.
      *
-    /**
-     * Mid Trade gate.
-     *
-     * Cycle per i-frame window (500ms):
-     *   1. Hit lands → i-frames start → pause opens for midTradePause ms.
-     *   2. During pause: all clicks suppressed.
-     *   3. Pause ends → remaining window = (500 - pauseMs) ms.
-     *      Click at hardcoded 125ms intervals (exactly 8 APS) for that window.
-     *   4. i-frames expire → fire immediately → repeat from step 1.
-     *
-     * pauseMs = 0 disables the module entirely.
-     * APS during the click window is always 7-8, never faster.
-     */
     private boolean isHitSelectPaused() {
         if (this.target == null) return false;
         if (!this.midTrade.getValue()) return false;
 
         int pauseMs = this.midTradePause.getValue();
-
-        // 0 = module disabled
         if (pauseMs == 0) return false;
 
         // Always let the first hit on a new target through immediately
@@ -172,23 +157,20 @@ public class KillAura extends Module {
         // Pause window: suppress all clicks
         if (now < this.midTradePauseUntil) return true;
 
-        // Past the pause — we're in the click window
-        Entity e = this.target.getEntity();
-        if (e instanceof EntityLivingBase) {
-            int hurt = ((EntityLivingBase) e).hurtResistantTime;
+        // Hardcoded 125ms interval enforced at ALL times — 8 APS consistently
+        // before pause, after pause, during i-frames, always
+        if (this.lastHitTime > 0L && now - this.lastHitTime < 125L) return true;
 
-            if (hurt > 0) {
-                // Target still in i-frames — enforce 125ms APS during click window
-                if (now - this.lastHitTime < 125L) return true;
-                // Rearm BackTrack buffer at start of each click window
-                BackTrack bt = (BackTrack) Myau.moduleManager.getModule(BackTrack.class);
-                if (bt != null && bt.isEnabled()) bt.onKillAuraResuming();
-                return false;
-            }
+        // Past the interval — only fire if target can actually take damage
+        Entity e = this.target.getEntity();
+        if (e instanceof EntityLivingBase
+                && ((EntityLivingBase) e).hurtResistantTime > 0) {
+            return true;
         }
 
-        // i-frames expired — fire immediately (fresh cycle, pause will be
-        // set by armHitSelect after this hit lands)
+        // Clear to fire — rearm BackTrack buffer
+        BackTrack bt = (BackTrack) Myau.moduleManager.getModule(BackTrack.class);
+        if (bt != null && bt.isEnabled()) bt.onKillAuraResuming();
         return false;
     }
 
