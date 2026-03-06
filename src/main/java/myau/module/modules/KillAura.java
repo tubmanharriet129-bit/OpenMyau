@@ -66,9 +66,9 @@ public class KillAura extends Module {
     private int lastTickProcessed;
 
     // -------------------------------------------------------
-    // Mid Trade state
+    // Hit Select state
     // -------------------------------------------------------
-    private long midTradePauseUntil = 0L;
+    private long hitSelectPauseUntil = 0L;
     long lastTargetSwitchTime = 0L; // package-private for BackTrack
     private int lastTargetId = -1;
 
@@ -105,9 +105,36 @@ public class KillAura extends Module {
     public final BooleanProperty teams;
     public final ModeProperty showTarget;
     public final ModeProperty debugLog;
-    public final IntProperty midTrade;
-    public final IntProperty midTradeResetWindow;
-    public final PercentProperty midTradeCancelRate;
+
+    // -------------------------------------------------------
+    // Hit Select properties
+    // -------------------------------------------------------
+    /** Maximum ms to suppress clicks after a hit (0 = disabled). */
+    public final IntProperty hitSelectPause;
+    /**
+     * After switching targets within this window (ms) the pause is cleared
+     * so the first hit on a fresh target is never suppressed. 0 = disabled.
+     */
+    public final IntProperty hitSelectResetWindow;
+    /**
+     * Chance (%) that a click is actually cancelled while inside the pause
+     * window. At 100% every click in the window is dropped; at 50% roughly
+     * half are dropped; at 0% the pause window does nothing.
+     */
+    public final PercentProperty hitSelectCancelRate;
+    /**
+     * Burst mode: gate every attack against the target's i-frame timer,
+     * only allowing hits that will register damage (hurtResistantTime == 0).
+     */
+    public final BooleanProperty hitSelectBurst;
+    /**
+     * In-combat cancel rate (%). Only used when burst is enabled. Controls
+     * the probability of dropping a click when the target still has i-frames.
+     *  100% → every off-i-frame click is dropped  (perfectly timed hits).
+     *   50% → ~half off-i-frame clicks land anyway (natural-looking pattern).
+     *    0% → burst mode effectively disabled.
+     */
+    public final PercentProperty hitSelectCombatCancelRate;
 
     // -------------------------------------------------------
     // Internal helpers
@@ -119,29 +146,67 @@ public class KillAura extends Module {
                 : 1000L / RandomUtil.nextLong(this.minCPS.getValue(), this.maxCPS.getValue());
     }
 
-    private boolean isMidTradePaused() {
-        if (this.midTrade.getValue() == 0) return false;
-        if (System.currentTimeMillis() >= this.midTradePauseUntil) return false;
-        if (this.midTradeResetWindow.getValue() > 0) {
-            long msSinceSwitch = System.currentTimeMillis() - this.lastTargetSwitchTime;
-            if (msSinceSwitch <= this.midTradeResetWindow.getValue()) {
-                this.midTradePauseUntil = 0L;
-                return false;
+    /**
+     * Two independent gates that compose cleanly:
+     *
+     * 1. Pause-window gate — suppresses clicks for up to {@code hitSelectPause} ms
+     *    after a hit, using {@code hitSelectCancelRate} as the drop probability.
+     *    Cleared early when the target can take damage again, or when the target
+     *    was switched within the reset window.
+     *
+     * 2. Burst gate — when {@code hitSelectBurst} is on, suppresses clicks while
+     *    the target still has i-frames, using {@code hitSelectCombatCancelRate}
+     *    as the drop probability (100% = perfect timing, 0% = burst disabled).
+     */
+    private boolean isHitSelectPaused() {
+        if (this.target == null) return false;
+
+        EntityLivingBase entity = this.target.getEntity();
+        boolean canTakeDamage = entity.hurtResistantTime == 0;
+
+        // ── Gate 1: pause-window ────────────────────────────────────────────
+        if (this.hitSelectPause.getValue() > 0
+                && System.currentTimeMillis() < this.hitSelectPauseUntil) {
+
+            // Early-exit A: target switched recently → clear pause so the
+            //               first hit on a new target is never blocked.
+            if (this.hitSelectResetWindow.getValue() > 0
+                    && (System.currentTimeMillis() - this.lastTargetSwitchTime)
+                       <= this.hitSelectResetWindow.getValue()) {
+                this.hitSelectPauseUntil = 0L;
+                // fall through to burst gate
+
+            // Early-exit B: target's i-frames expired → hit will register,
+            //               no point delaying further.
+            } else if (canTakeDamage) {
+                this.hitSelectPauseUntil = 0L;
+                // fall through to burst gate
+
+            // Still inside the window — apply cancel rate.
+            } else {
+                int rate = this.hitSelectCancelRate.getValue();
+                if (rate >= 100) return true;
+                if (rate > 0 && (Math.random() * 100.0) < rate) return true;
             }
         }
-        if (this.target != null && this.target.getEntity().hurtResistantTime == 0) {
-            this.midTradePauseUntil = 0L;
-            return false;
+
+        // ── Gate 2: burst ───────────────────────────────────────────────────
+        // Fires independently of the pause window: as long as burst is on and
+        // the target cannot take damage, we roll the in-combat cancel chance.
+        if (this.hitSelectBurst.getValue() && !canTakeDamage) {
+            int rate = this.hitSelectCombatCancelRate.getValue();
+            if (rate >= 100) return true;
+            if (rate > 0 && (Math.random() * 100.0) < rate) return true;
         }
-        int cancelRate = this.midTradeCancelRate.getValue();
-        if (cancelRate <= 0) return false;
-        if (cancelRate < 100 && (Math.random() * 100) >= cancelRate) return false;
-        return true;
+
+        return false;
     }
 
-    private void armMidTrade() {
-        if (this.midTrade.getValue() == 0) return;
-        this.midTradePauseUntil = System.currentTimeMillis() + this.midTrade.getValue();
+    /** Called after each successful attack to arm the pause-window timer. */
+    private void armHitSelect() {
+        if (this.hitSelectPause.getValue() > 0) {
+            this.hitSelectPauseUntil = System.currentTimeMillis() + this.hitSelectPause.getValue();
+        }
     }
 
     private void notifyTargetChanged(int newEntityId) {
@@ -161,7 +226,7 @@ public class KillAura extends Module {
                 return false;
             } else if (this.attackDelayMS > 0L) {
                 return false;
-            } else if (this.isMidTradePaused()) {
+            } else if (this.isHitSelectPaused()) {
                 return false;
             } else {
                 this.attackDelayMS = this.attackDelayMS + this.getAttackDelay();
@@ -181,7 +246,7 @@ public class KillAura extends Module {
                         PlayerUtil.attackEntity(this.target.getEntity());
                     }
                     this.hitRegistered = true;
-                    this.armMidTrade();
+                    this.armHitSelect();
                     return true;
                 }
             }
@@ -388,9 +453,27 @@ public class KillAura extends Module {
         this.teams = new BooleanProperty("teams", true);
         this.showTarget = new ModeProperty("show-target", 0, new String[]{"NONE", "DEFAULT", "HUD"});
         this.debugLog = new ModeProperty("debug-log", 0, new String[]{"NONE", "HEALTH"});
-        this.midTrade = new IntProperty("mid-trade", 0, 0, 500);
-        this.midTradeResetWindow = new IntProperty("mid-trade-reset", 0, 0, 500);
-        this.midTradeCancelRate = new PercentProperty("mid-trade-cancel-rate", 100);
+
+        // ── Hit Select ────────────────────────────────────────────────────────
+        // Pause-window: suppress clicks for up to N ms after a hit lands.
+        // 0 = disabled (no pause window at all).
+        this.hitSelectPause = new IntProperty("hit-select-pause", 0, 0, 500);
+        // Reset window: if the target switches within N ms, clear the pause so
+        // the first hit on the new target is never held back. 0 = disabled.
+        this.hitSelectResetWindow = new IntProperty("hit-select-reset", 0, 0, 500);
+        // Cancel rate inside the pause window (0–100%).
+        // 100% → every click in the window is dropped.
+        //  50% → ~half are dropped, giving a natural-looking speed reduction.
+        //   0% → pause window has no effect.
+        this.hitSelectCancelRate = new PercentProperty("hit-select-cancel-rate", 100);
+        // Burst mode: additionally gate attacks by the target's i-frame timer,
+        // only passing through clicks that will actually deal damage.
+        this.hitSelectBurst = new BooleanProperty("hit-select-burst", false);
+        // In-combat cancel rate (0–100%). Only active when burst is enabled.
+        // Controls how aggressively clicks are dropped while the target has
+        // i-frames. 100% = perfectly timed hits. 0% = burst disabled.
+        this.hitSelectCombatCancelRate = new PercentProperty("hit-select-combat-rate", 100,
+                this.hitSelectBurst::getValue);
     }
 
     // -------------------------------------------------------
@@ -974,7 +1057,7 @@ public class KillAura extends Module {
         this.hitRegistered = false;
         this.attackDelayMS = 0L;
         this.blockTick = 0;
-        this.midTradePauseUntil = 0L;
+        this.hitSelectPauseUntil = 0L;
         this.lastTargetSwitchTime = 0L;
         this.lastTargetId = -1;
     }
@@ -985,7 +1068,7 @@ public class KillAura extends Module {
         this.blockingState = false;
         this.isBlocking = false;
         this.fakeBlockState = false;
-        this.midTradePauseUntil = 0L;
+        this.hitSelectPauseUntil = 0L;
         this.lastTargetSwitchTime = 0L;
         this.lastTargetId = -1;
     }
