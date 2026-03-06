@@ -134,6 +134,12 @@ public class KillAura extends Module {
     //                       new target without waiting.
     public final IntProperty midTrade;
     public final IntProperty midTradeResetWindow;
+    // midTradeCancelRate : 0 = never cancel clicks during iFrames (mid trade off effectively).
+    //                      100 = always cancel clicks during iFrames (perfectly timed, max speed).
+    //                      50 = cancel 50% of in-iFrame clicks, producing a more legit pattern.
+    //                      Only affects hits predicted to NOT deal damage. Hits that WILL deal
+    //                      damage (hurtResistantTime == 0) are never cancelled regardless.
+    public final PercentProperty midTradeCancelRate;
 
     // -------------------------------------------------------
     // Internal helpers
@@ -171,12 +177,21 @@ public class KillAura extends Module {
             }
         }
 
-        // Burst-click release: target can take damage right now, so a click
-        // will register properly — allow it immediately and cancel the pause.
+        // Burst-click release: target can take damage right now — this hit WILL register,
+        // so never cancel it regardless of cancel rate.
         if (this.target != null && this.target.getEntity().hurtResistantTime == 0) {
             this.midTradePauseUntil = 0L;
             return false;
         }
+
+        // Cancel rate check: target IS still in iFrames so this hit would NOT deal damage.
+        // Roll against midTradeCancelRate to decide whether to suppress it.
+        // At 100% we always suppress (perfectly timed, fastest movement).
+        // At 0% we never suppress (mid trade has no effect on in-iFrame clicks).
+        // At 50% we suppress roughly half, producing a more legit-looking pattern.
+        int cancelRate = this.midTradeCancelRate.getValue();
+        if (cancelRate <= 0) return false;
+        if (cancelRate < 100 && (Math.random() * 100) >= cancelRate) return false;
 
         // Still suppressed.
         return true;
@@ -450,6 +465,8 @@ public class KillAura extends Module {
         //                  that immediately clears any active suppression.
         this.midTrade = new IntProperty("mid-trade", 0, 0, 500);
         this.midTradeResetWindow = new IntProperty("mid-trade-reset", 0, 0, 500);
+        // 0 = never cancel in-iFrame clicks, 100 = always cancel (default full suppression).
+        this.midTradeCancelRate = new PercentProperty("mid-trade-cancel-rate", 100);
     }
 
     // -------------------------------------------------------
@@ -1140,4 +1157,3 @@ public class KillAura extends Module {
         }
     }
 }
-
