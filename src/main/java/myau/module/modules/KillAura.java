@@ -68,14 +68,14 @@ public class KillAura extends Module {
     // -------------------------------------------------------
     // Mid Trade state
     // -------------------------------------------------------
-    // Counts confirmed attacks in the current burst (resets at 2).
-    private int midTradeAttackCount = 0;
-    // Epoch ms at which the burst pause expires. Attacks are held while
-    // System.currentTimeMillis() < midTradePauseUntil.
+    // Timestamp after which clicks are suppressed until either:
+    //   (a) the target's hurtResistantTime reaches 0  — burst release
+    //   (b) the deadline itself passes                 — hard release
+    // At midTrade == 0 the feature is fully disabled.
     private long midTradePauseUntil = 0L;
     // Epoch ms of the most recent target-entity-id change.
     private long lastTargetSwitchTime = 0L;
-    // Entity ID that was active on the previous target-selection tick.
+    // Entity ID that was active on the previous targeting tick.
     private int lastTargetId = -1;
 
     public final ModeProperty mode;
@@ -115,12 +115,23 @@ public class KillAura extends Module {
     // -------------------------------------------------------
     // Mid Trade properties
     // -------------------------------------------------------
-    // midTrade            : 0 = disabled. 1-500 = exact ms pause inserted after
-    //                       every 2nd attack. 500 covers the full 1.8 hurt time.
-    // midTradeResetWindow : 0 = bypass disabled. 1-500 = if a target switch
-    //                       occurred within this many ms the active burst pause
-    //                       is cleared and the counter resets immediately,
-    //                       letting you continue attacking the new target.
+    // midTrade            : 0 = disabled entirely (attack freely).
+    //                       1–500 = maximum ms to suppress clicks after each hit.
+    //                       The suppression ends EARLY the moment the target's
+    //                       hurtResistantTime drops back to 0, so you never
+    //                       waste a tick waiting when the target can already be
+    //                       damaged again. At 500 you cover the full 1.8
+    //                       hurt window; lower values shorten how long you will
+    //                       wait even if the target is still in iFrames.
+    //                       Higher values = you move faster because you never
+    //                       send useless hits that slow you down with extra
+    //                       knockback. Lower values approach normal behaviour.
+    //
+    // midTradeResetWindow : 0 = rapid-switch bypass disabled.
+    //                       1–500 = if you switched to a new target within this
+    //                       many ms the active suppression is immediately
+    //                       cleared so you can open with a fresh hit on the
+    //                       new target without waiting.
     public final IntProperty midTrade;
     public final IntProperty midTradeResetWindow;
 
@@ -135,50 +146,55 @@ public class KillAura extends Module {
     }
 
     /**
-     * Returns true when the Mid Trade burst pause is currently blocking attacks.
+     * Returns true when Mid Trade is actively suppressing the next click.
      *
-     * Bypass rule: if midTradeResetWindow > 0 and the player switched targets
-     * within that exact ms window, the pause is cleared and this returns false,
-     * allowing immediate attacking on the new target.
+     * Suppression ends when ANY of the following is true:
+     *   1. The hard deadline has passed (midTradePauseUntil <= now).
+     *   2. The target's hurtResistantTime is 0 — it can take full damage,
+     *      so clicking now is never wasteful (burst-click release).
+     *   3. The player switched targets within midTradeResetWindow ms
+     *      (rapid-switch bypass).
      */
     private boolean isMidTradePaused() {
-        // Feature is off when slider is at 0.
+        // Feature off.
         if (this.midTrade.getValue() == 0) return false;
 
-        // Pause has already expired naturally.
+        // Hard deadline already passed — no suppression.
         if (System.currentTimeMillis() >= this.midTradePauseUntil) return false;
 
-        // Rapid-switch bypass: only active when the window slider is above 0.
+        // Rapid-switch bypass.
         if (this.midTradeResetWindow.getValue() > 0) {
             long msSinceSwitch = System.currentTimeMillis() - this.lastTargetSwitchTime;
             if (msSinceSwitch <= this.midTradeResetWindow.getValue()) {
-                // Clear the pause so further calls also return false this burst.
                 this.midTradePauseUntil = 0L;
-                this.midTradeAttackCount = 0;
                 return false;
             }
         }
 
+        // Burst-click release: target can take damage right now, so a click
+        // will register properly — allow it immediately and cancel the pause.
+        if (this.target != null && this.target.getEntity().hurtResistantTime == 0) {
+            this.midTradePauseUntil = 0L;
+            return false;
+        }
+
+        // Still suppressed.
         return true;
     }
 
     /**
-     * Called after every confirmed attack to track the burst count.
-     * On the 2nd attack the pause timer is armed with exactly midTrade ms.
+     * Arms the Mid Trade suppression window after every confirmed hit.
+     * The window lasts at most midTrade ms, but isMidTradePaused() will
+     * release it early as soon as the target's iFrames expire.
      */
-    private void advanceMidTrade() {
+    private void armMidTrade() {
         if (this.midTrade.getValue() == 0) return;
-
-        this.midTradeAttackCount++;
-        if (this.midTradeAttackCount >= 2) {
-            this.midTradeAttackCount = 0;
-            this.midTradePauseUntil = System.currentTimeMillis() + this.midTrade.getValue();
-        }
+        this.midTradePauseUntil = System.currentTimeMillis() + this.midTrade.getValue();
     }
 
     /**
      * Called whenever a new target entity is chosen by the targeting loop.
-     * Records the switch timestamp used by the rapid-switch bypass check.
+     * Records the switch timestamp so the rapid-switch bypass can fire.
      */
     private void notifyTargetChanged(int newEntityId) {
         if (newEntityId != this.lastTargetId) {
@@ -198,8 +214,10 @@ public class KillAura extends Module {
             } else if (this.attackDelayMS > 0L) {
                 return false;
             } else if (this.isMidTradePaused()) {
-                // Mid Trade burst pause is active – hold the attack until it expires
-                // (or until a rapid target switch clears it).
+                // Mid Trade is suppressing this click because the target is still
+                // in iFrames and we have not yet reached the hard deadline.
+                // Returning false keeps the swing animation and packet suppressed,
+                // which means no extra knockback and faster movement for the player.
                 return false;
             } else {
                 this.attackDelayMS = this.attackDelayMS + this.getAttackDelay();
@@ -219,8 +237,8 @@ public class KillAura extends Module {
                         PlayerUtil.attackEntity(this.target.getEntity());
                     }
                     this.hitRegistered = true;
-                    // Advance burst counter — arms the pause on the 2nd attack.
-                    this.advanceMidTrade();
+                    // Arm the Mid Trade suppression window for the next click.
+                    this.armMidTrade();
                     return true;
                 }
             }
@@ -427,7 +445,9 @@ public class KillAura extends Module {
         this.teams = new BooleanProperty("teams", true);
         this.showTarget = new ModeProperty("show-target", 0, new String[]{"NONE", "DEFAULT", "HUD"});
         this.debugLog = new ModeProperty("debug-log", 0, new String[]{"NONE", "HEALTH"});
-        // Mid Trade sliders – every integer from 0 to 500 is a valid setting.
+        // Mid Trade: 0 = off, 1-500 = max ms to suppress clicks after a hit.
+        // Mid Trade Reset: 0 = off, 1-500 = ms window after a target switch
+        //                  that immediately clears any active suppression.
         this.midTrade = new IntProperty("mid-trade", 0, 0, 500);
         this.midTradeResetWindow = new IntProperty("mid-trade-reset", 0, 0, 500);
     }
@@ -844,8 +864,7 @@ public class KillAura extends Module {
                                 this.switchTick = 0;
                             }
                             EntityLivingBase chosen = targets.get(this.switchTick);
-                            // Inform Mid Trade of any target change so the rapid-switch
-                            // bypass window can be evaluated on the next attack attempt.
+                            // Track target changes for the rapid-switch bypass.
                             this.notifyTargetChanged(chosen.getEntityId());
                             this.target = new AttackData(chosen);
                         }
@@ -1011,7 +1030,6 @@ public class KillAura extends Module {
         this.hitRegistered = false;
         this.attackDelayMS = 0L;
         this.blockTick = 0;
-        this.midTradeAttackCount = 0;
         this.midTradePauseUntil = 0L;
         this.lastTargetSwitchTime = 0L;
         this.lastTargetId = -1;
@@ -1023,7 +1041,6 @@ public class KillAura extends Module {
         this.blockingState = false;
         this.isBlocking = false;
         this.fakeBlockState = false;
-        this.midTradeAttackCount = 0;
         this.midTradePauseUntil = 0L;
         this.lastTargetSwitchTime = 0L;
         this.lastTargetId = -1;
