@@ -497,9 +497,6 @@ public class BackTrack extends Module {
         if (pkt instanceof S18PacketEntityTeleport) {
             return ((S18PacketEntityTeleport) pkt).getEntityId() == entityId;
         }
-            Entity e = mc.theWorld.getEntityByID(id);
-            return e != null && e.getEntityId() == entityId;
-        }
         return false;
     }
 
