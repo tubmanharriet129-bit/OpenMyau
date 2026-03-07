@@ -18,11 +18,17 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityLivingBase;
 import net.minecraft.entity.player.EntityPlayer;
+import net.minecraft.item.ItemAxe;
+import net.minecraft.item.ItemBow;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.ItemSword;
 import net.minecraft.network.Packet;
 import net.minecraft.network.play.client.C02PacketUseEntity;
 import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+import net.minecraft.network.play.server.S12PacketEntityVelocity;
 import net.minecraft.network.play.server.S19PacketEntityStatus;
 import net.minecraft.util.AxisAlignedBB;
+import org.lwjgl.opengl.GL11;
 
 import java.awt.*;
 import java.util.UUID;
@@ -81,18 +87,81 @@ public class BackTrack extends Module {
 
     // ── Settings ──────────────────────────────────────────────────────────
 
-    public final FloatProperty   minDistance   = new FloatProperty("min-dist",  1.0f, 0.5f, 4.0f);
-    public final FloatProperty   maxDistance   = new FloatProperty("max-dist",  4.0f, 1.0f, 6.0f);
+    // Distance
+    public final FloatProperty   minDistance    = new FloatProperty("min-dist",   1.0f, 0.5f, 4.0f);
+    public final FloatProperty   maxDistance    = new FloatProperty("max-dist",   4.0f, 1.0f, 6.0f);
+
+    // Delay clamps
+    public final IntProperty     minDelay       = new IntProperty("min-delay",   45,   0,  200);
+    public final IntProperty     maxDelay       = new IntProperty("max-delay",  160,  50,  500);
 
     /**
      * When hurtResistantTime drops to this value, the override is released
      * so KillAura can fire at the true position as i-frames expire.
-     * Lower = more aggressive double-hit timing. 1 = last possible moment.
      */
-    public final IntProperty     releaseTiming = new IntProperty("release-timing", 2, 1, 10);
-    public final BooleanProperty jumpPeak      = new BooleanProperty("jump-peak",   true);
-    public final BooleanProperty strafeGuard   = new BooleanProperty("strafe-guard", true);
-    public final ModeProperty    showPosition  = new ModeProperty("show-position", 1,
+    public final IntProperty     releaseTiming  = new IntProperty("release-timing",  2, 1, 10);
+
+    /**
+     * Backtrack will not activate if the target's hurtResistantTime is
+     * higher than this value. Prevents engaging mid i-frame when the hit
+     * window has already been consumed.
+     * 0 = disabled (always allow engagement regardless of hurtTime).
+     */
+    public final IntProperty     maxHurtTime    = new IntProperty("max-hurt-time",   0, 0, 10);
+
+    /**
+     * Minimum time in milliseconds that must pass after Backtrack deactivates
+     * before it can activate again. Prevents rapid re-engagement flickering
+     * after the target leaves range or a reset is forced.
+     */
+    public final IntProperty     cooldownMs     = new IntProperty("cooldown", 0, 0, 2000);
+
+    /**
+     * When enabled, Backtrack deactivates immediately if the local player
+     * receives a velocity (knockback) packet. Prevents anticheat from
+     * flagging delayed knockback processing.
+     */
+    public final BooleanProperty disableOnHit   = new BooleanProperty("disable-on-hit",  true);
+
+    /**
+     * When enabled, Backtrack only activates while the player is holding
+     * a weapon (sword, axe, or bow).
+     */
+    public final BooleanProperty weaponOnly     = new BooleanProperty("weapon-only", true);
+
+    public final BooleanProperty jumpPeak       = new BooleanProperty("jump-peak",    true);
+    public final BooleanProperty strafeGuard    = new BooleanProperty("strafe-guard", true);
+
+    // ── Real position indicator ───────────────────────────────────────────
+
+    /**
+     * Renders a box at the target's true server position (before the
+     * Backtrack offset). Shows where they actually are regardless of lag.
+     */
+    public final BooleanProperty showRealPos    = new BooleanProperty("real-pos",       false);
+
+    /** Draw a filled box (true) or outline only (false). */
+    public final BooleanProperty realPosFilled  = new BooleanProperty("real-pos-filled", false,
+            this.showRealPos::getValue);
+
+    /** Rotate the box to match the target's head yaw (shows facing direction). */
+    public final BooleanProperty realPosHeadRot = new BooleanProperty("real-pos-head-rot", false,
+            this.showRealPos::getValue);
+
+    public final FloatProperty   realPosLineW   = new FloatProperty("real-pos-line-width", 1.0f, 0.5f, 3.0f,
+            this.showRealPos::getValue);
+
+    public final IntProperty     realPosR       = new IntProperty("real-pos-r", 255, 0, 255,
+            this.showRealPos::getValue);
+    public final IntProperty     realPosG       = new IntProperty("real-pos-g",   0, 0, 255,
+            this.showRealPos::getValue);
+    public final IntProperty     realPosB       = new IntProperty("real-pos-b",   0, 0, 255,
+            this.showRealPos::getValue);
+    public final IntProperty     realPosA       = new IntProperty("real-pos-a", 180, 0, 255,
+            this.showRealPos::getValue);
+
+    // ── Legacy show-position (override box) ──────────────────────────────
+    public final ModeProperty    showPosition   = new ModeProperty("show-position", 1,
             new String[]{"NONE", "DEFAULT", "HUD"});
 
     // ── Ring Buffer ───────────────────────────────────────────────────────
@@ -207,11 +276,23 @@ public class BackTrack extends Module {
     /** True during KillAura burst-end release phase. */
     private boolean releasing = false;
 
+    /**
+     * Wall-clock ms before which Backtrack may not re-engage.
+     * Set to now + cooldownMs whenever resetState() is called while engaged.
+     */
+    private long cooldownUntil = 0L;
+
+    /**
+     * Set true when a velocity packet is received for the local player
+     * while disable-on-hit is enabled. Triggers immediate reset.
+     */
+    private boolean hitVelocityReceived = false;
+
     // ── Constructor ───────────────────────────────────────────────────────
 
     public BackTrack() { super("BackTrack", false); }
 
-    @Override public void onEnabled()  { this.resetState(); }
+    @Override public void onEnabled()  { this.cooldownUntil = 0L; this.resetState(); }
     @Override public void onDisabled() { this.resetState(); }
 
     // ── Main Tick ─────────────────────────────────────────────────────────
@@ -250,12 +331,29 @@ public class BackTrack extends Module {
 
         if (!this.engaged) return;
 
+        // ── Weapon-only gate ──────────────────────────────────────────
+        if (this.weaponOnly.getValue() && !this.isHoldingWeapon()) {
+            this.resetState(); return;
+        }
+
+        // ── Disable-on-hit: velocity packet received → immediate reset ─
+        if (this.hitVelocityReceived) {
+            this.hitVelocityReceived = false;
+            this.resetState(); return;
+        }
+
         EntityLivingBase target = this.getCurrentTarget();
         if (target == null) { this.resetState(); return; }
 
         double dist = mc.thePlayer.getDistanceToEntity(target);
         if (dist < this.minDistance.getValue() || dist > this.maxDistance.getValue()) {
             this.resetState(); return;
+        }
+
+        // ── maxHurtTime gate: don't activate while target is deep in i-frames ─
+        int mht = this.maxHurtTime.getValue();
+        if (mht > 0 && target.hurtResistantTime > mht) {
+            this.clearOverride(target); return;
         }
 
         this.engageTick++;
@@ -374,7 +472,7 @@ public class BackTrack extends Module {
         double tpsFactor     = this.avgTickMs / 50.0;
 
         double raw = (baseDelay + velFactor + comboBoost - strafePenalty) * tpsFactor;
-        this.adaptiveDelay = Math.max(45.0, Math.min(raw, 160.0));
+        this.adaptiveDelay = Math.max(this.minDelay.getValue(), Math.min(raw, this.maxDelay.getValue()));
 
         // ── Predictive snapshot selection ──────────────────────────────
         // Convert delay to ticks, add forward bias for moving targets.
@@ -489,6 +587,10 @@ public class BackTrack extends Module {
             S19PacketEntityStatus s19 = (S19PacketEntityStatus) event.getPacket();
             if (s19.getOpCode() == 2 && mc.theWorld != null
                     && this.pendingTargetId != -1) {
+
+                // Cooldown: do not re-engage if cooldown has not expired
+                if (System.currentTimeMillis() < this.cooldownUntil) return;
+
                 Entity hit = s19.getEntity(mc.theWorld);
                 if (hit != null && hit.getEntityId() == this.pendingTargetId) {
                     if (this.targetId != -1 && this.targetId != this.pendingTargetId) {
@@ -508,6 +610,18 @@ public class BackTrack extends Module {
                     this.ticksSinceHit   = 0;
                     this.releasing       = false;
                 }
+            }
+            return;
+        }
+
+        // S12: local player received knockback — disable-on-hit
+        if (event.getType() == EventType.RECEIVE
+                && event.getPacket() instanceof S12PacketEntityVelocity
+                && this.disableOnHit.getValue()) {
+            S12PacketEntityVelocity s12 = (S12PacketEntityVelocity) event.getPacket();
+            if (s12.getEntityID() == mc.thePlayer.getEntityId() && this.engaged) {
+                // Flag for reset on next tick — don't reset from packet thread
+                this.hitVelocityReceived = true;
             }
             return;
         }
@@ -594,36 +708,106 @@ public class BackTrack extends Module {
         if (this.engaged && this.targetId != -1) {
             EntityLivingBase e = this.getCurrentTarget();
             if (e != null) this.clearOverride(e);
+            // Stamp cooldown from now — prevents immediate re-engagement
+            int cd = this.cooldownMs.getValue();
+            if (cd > 0) this.cooldownUntil = System.currentTimeMillis() + cd;
         }
-        this.count           = 0;
-        this.writeIndex      = 0;
-        this.active          = false;
-        this.engaged         = false;
-        this.releasing       = false;
-        this.engageTick      = 0;
-        this.targetId        = -1;
-        this.pendingTargetId = -1;
-        this.prevVelTracked  = false;
-        this.prevYTracked    = false;
-        this.prevVx          = 0.0;
-        this.prevVz          = 0.0;
-        this.prevSpeed       = 0.0;
-        this.appliedOffsetX  = 0.0;
-        this.appliedOffsetZ  = 0.0;
-        this.suspendTicks    = 0;
-        this.ticksSinceHit   = 999;
-        this.adaptiveDelay   = 100.0;
-        this.strafeDot       = 1.0;
-        this.realBB          = null;
+        this.count                = 0;
+        this.writeIndex           = 0;
+        this.active               = false;
+        this.engaged              = false;
+        this.releasing            = false;
+        this.hitVelocityReceived  = false;
+        this.engageTick           = 0;
+        this.targetId             = -1;
+        this.pendingTargetId      = -1;
+        this.prevVelTracked       = false;
+        this.prevYTracked         = false;
+        this.prevVx               = 0.0;
+        this.prevVz               = 0.0;
+        this.prevSpeed            = 0.0;
+        this.appliedOffsetX       = 0.0;
+        this.appliedOffsetZ       = 0.0;
+        this.suspendTicks         = 0;
+        this.ticksSinceHit        = 999;
+        this.adaptiveDelay        = 100.0;
+        this.strafeDot            = 1.0;
+        this.realBB               = null;
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────
+
+    /**
+     * Returns true if the player is holding a weapon — sword, axe, or bow.
+     * Backtrack only activates when this is true and weapon-only is enabled.
+     */
+    private boolean isHoldingWeapon() {
+        if (mc.thePlayer == null) return false;
+        ItemStack held = mc.thePlayer.getHeldItem();
+        if (held == null) return false;
+        return held.getItem() instanceof ItemSword
+                || held.getItem() instanceof ItemAxe
+                || held.getItem() instanceof ItemBow;
     }
 
     // ── Render ────────────────────────────────────────────────────────────
 
     @EventTarget
     public void onRender3D(Render3DEvent event) {
-        if (!this.isEnabled() || this.showPosition.getValue() == 0) return;
+        if (!this.isEnabled()) return;
         EntityLivingBase target = this.getCurrentTarget();
         if (target == null) return;
+
+        double rpX = ((IAccessorRenderManager) mc.getRenderManager()).getRenderPosX();
+        double rpY = ((IAccessorRenderManager) mc.getRenderManager()).getRenderPosY();
+        double rpZ = ((IAccessorRenderManager) mc.getRenderManager()).getRenderPosZ();
+
+        // ── Real position indicator ───────────────────────────────────
+        // Draws at the true server-authoritative position (realX/Z),
+        // independent of whatever offset Backtrack has applied.
+        if (this.showRealPos.getValue() && this.active && this.realBB != null) {
+            Color rColor = new Color(
+                    this.realPosR.getValue(),
+                    this.realPosG.getValue(),
+                    this.realPosB.getValue(),
+                    this.realPosA.getValue());
+
+            float lw = this.realPosLineW.getValue();
+
+            // Reconstruct axis-aligned BB from stored realBB, shifted to render space
+            AxisAlignedBB rbb = this.realBB.offset(-rpX, -rpY, -rpZ);
+
+            RenderUtil.enableRenderState();
+            GL11.glLineWidth(lw);
+
+            if (this.realPosHeadRot.getValue()) {
+                // Rotate the box around its centre Y axis to match target head yaw
+                double cx = (rbb.minX + rbb.maxX) * 0.5;
+                double cz = (rbb.minZ + rbb.maxZ) * 0.5;
+                GL11.glPushMatrix();
+                GL11.glTranslated(cx, 0.0, cz);
+                GL11.glRotatef(-target.rotationYawHead, 0.0f, 1.0f, 0.0f);
+                GL11.glTranslated(-cx, 0.0, -cz);
+                if (this.realPosFilled.getValue()) {
+                    RenderUtil.drawFilledBox(rbb, rColor.getRed(), rColor.getGreen(), rColor.getBlue());
+                } else {
+                    RenderUtil.drawBoundingBox(rbb, rColor.getRed(), rColor.getGreen(), rColor.getBlue());
+                }
+                GL11.glPopMatrix();
+            } else {
+                if (this.realPosFilled.getValue()) {
+                    RenderUtil.drawFilledBox(rbb, rColor.getRed(), rColor.getGreen(), rColor.getBlue());
+                } else {
+                    RenderUtil.drawBoundingBox(rbb, rColor.getRed(), rColor.getGreen(), rColor.getBlue());
+                }
+            }
+
+            GL11.glLineWidth(1.0f);
+            RenderUtil.disableRenderState();
+        }
+
+        // ── Override position indicator (existing show-position) ──────
+        if (this.showPosition.getValue() == 0) return;
 
         Color color;
         switch (this.showPosition.getValue()) {
@@ -645,11 +829,7 @@ public class BackTrack extends Module {
                 target.posZ - target.width  / 2.0,
                 target.posX + target.width  / 2.0, target.posY + target.height,
                 target.posZ + target.width  / 2.0
-        ).expand(size, size, size).offset(
-                -((IAccessorRenderManager) mc.getRenderManager()).getRenderPosX(),
-                -((IAccessorRenderManager) mc.getRenderManager()).getRenderPosY(),
-                -((IAccessorRenderManager) mc.getRenderManager()).getRenderPosZ()
-        );
+        ).expand(size, size, size).offset(-rpX, -rpY, -rpZ);
 
         RenderUtil.enableRenderState();
         RenderUtil.drawFilledBox(aabb, color.getRed(), color.getGreen(), color.getBlue());
