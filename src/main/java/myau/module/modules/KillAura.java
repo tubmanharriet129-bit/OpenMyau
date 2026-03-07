@@ -69,7 +69,10 @@ public class KillAura extends Module {
     // Hit Select state
     // -------------------------------------------------------
     private boolean hitSelectFreshTarget = false;
-    private long lastHitTime = 0L;
+    private long lastHitTime       = 0L;
+    private long burstStartTime    = 0L;
+    private int  burstSize         = 2;   // randomised per burst: 2-4
+    private int  midTradeHitCount  = 0;
     private long midTradePauseUntil = 0L;
     long lastTargetSwitchTime = 0L;
     private int lastTargetId = -1;
@@ -136,7 +139,11 @@ public class KillAura extends Module {
     }
 
     /**
-     * Mid Trade gate.
+     * Burst click gate.
+     *
+     * Pattern: 3-4 clicks at 125-140ms intervals, pause, repeat.
+     * Pause duration is configurable 0-500ms.
+     * 0 = disabled.
      */
     private boolean isHitSelectPaused() {
         if (this.target == null) return false;
@@ -145,48 +152,46 @@ public class KillAura extends Module {
         int pauseMs = this.midTradePause.getValue();
         if (pauseMs == 0) return false;
 
-        // Always let the first hit on a new target through immediately
         if (this.hitSelectFreshTarget) {
             this.hitSelectFreshTarget = false;
             this.midTradePauseUntil = 0L;
+            this.midTradeHitCount = 0;
+            this.burstSize = 3 + (int)(Math.random() * 2); // 3 or 4
             return false;
         }
 
         long now = System.currentTimeMillis();
 
-        // Pause window: suppress all clicks
+        // Pause window
         if (now < this.midTradePauseUntil) return true;
 
-        // Hardcoded 125ms interval enforced at ALL times — 8 APS consistently
-        // before pause, after pause, during i-frames, always
-        if (this.lastHitTime > 0L && now - this.lastHitTime < 125L) return true;
-
-        // Past the interval — only fire if target can actually take damage
-        Entity e = this.target.getEntity();
-        if (e instanceof EntityLivingBase
-                && ((EntityLivingBase) e).hurtResistantTime > 0) {
+        // Burst complete — open pause, notify BackTrack, pick new burst size
+        if (this.midTradeHitCount >= this.burstSize) {
+            this.midTradePauseUntil = now + pauseMs;
+            this.midTradeHitCount = 0;
+            this.burstSize = 3 + (int)(Math.random() * 2); // 3 or 4 for next burst
+            BackTrack bt = (BackTrack) Myau.moduleManager.getModule(BackTrack.class);
+            if (bt != null && bt.isEnabled()) bt.onKillAuraBurstComplete();
             return true;
         }
 
-        // Clear to fire — rearm BackTrack buffer
-        BackTrack bt = (BackTrack) Myau.moduleManager.getModule(BackTrack.class);
-        if (bt != null && bt.isEnabled()) bt.onKillAuraResuming();
+        // First hit of burst fires immediately
+        if (this.midTradeHitCount == 0) {
+            BackTrack bt = (BackTrack) Myau.moduleManager.getModule(BackTrack.class);
+            if (bt != null && bt.isEnabled()) bt.onKillAuraResuming();
+            return false;
+        }
+
+        // 125-140ms between each click in the burst (7-8 CPS)
+        long interval = 125L + (long)(Math.random() * 15L);
+        if (now - this.lastHitTime < interval) return true;
+
         return false;
     }
 
-    /**
-     * Called after each successful attack.
-     * Opens the pause window and notifies BackTrack to flush.
-     */
     private void armHitSelect() {
-        long now = System.currentTimeMillis();
-        this.lastHitTime = now;
-        int pauseMs = this.midTradePause.getValue();
-        if (pauseMs > 0 && this.midTrade.getValue()) {
-            this.midTradePauseUntil = now + pauseMs;
-            BackTrack bt = (BackTrack) Myau.moduleManager.getModule(BackTrack.class);
-            if (bt != null && bt.isEnabled()) bt.onKillAuraBurstComplete();
-        }
+        this.lastHitTime = System.currentTimeMillis();
+        this.midTradeHitCount++;
     }
 
     private void notifyTargetChanged(int newEntityId) {
@@ -1030,6 +1035,8 @@ public class KillAura extends Module {
         this.blockTick = 0;
         this.hitSelectFreshTarget = false;
         this.lastHitTime = 0L;
+        this.midTradeHitCount = 0;
+        this.burstSize = 3;
         this.midTradePauseUntil = 0L;
         this.lastTargetSwitchTime = 0L;
         this.lastTargetId = -1;
@@ -1043,6 +1050,8 @@ public class KillAura extends Module {
         this.fakeBlockState = false;
         this.hitSelectFreshTarget = false;
         this.lastHitTime = 0L;
+        this.midTradeHitCount = 0;
+        this.burstSize = 3;
         this.midTradePauseUntil = 0L;
         this.lastTargetSwitchTime = 0L;
         this.lastTargetId = -1;
