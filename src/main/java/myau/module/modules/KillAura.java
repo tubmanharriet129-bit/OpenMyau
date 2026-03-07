@@ -66,16 +66,43 @@ public class KillAura extends Module {
     private int lastTickProcessed;
 
     // -------------------------------------------------------
-    // Hit Select state
+    // Mid Trade — Burst Engine state
     // -------------------------------------------------------
-    private boolean hitSelectFreshTarget = false;
-    private long lastHitTime       = 0L;
-    private long burstStartTime    = 0L;
-    private int  burstSize         = 2;   // randomised per burst: 2-4
-    private int  midTradeHitCount  = 0;
-    private long midTradePauseUntil = 0L;
-    long lastTargetSwitchTime = 0L;
+
+    /** Current phase of the burst state machine. */
+    private enum BurstPhase { IDLE, BURST, PAUSE }
+    private BurstPhase burstPhase = BurstPhase.IDLE;
+
+    /** Wall-clock ms when the current burst window opened. */
+    private long burstWindowStart = 0L;
+
+    /**
+     * Wall-clock ms when the last burst ended.
+     * Pause check: if (now - lastBurstEnd < pauseDurationMs) → cancel.
+     * Pure wall clock — no ping, no TPS.
+     */
+    private long lastBurstEnd = 0L;
+
+    /** Wall-clock ms of the last generated click attempt. */
+    private long lastClickAttempt = 0L;
+
+    /** Interval (ms) until the next click attempt — re-randomised after each attempt. */
+    private long nextClickInterval = 0L;
+
+    /**
+     * ticksExisted value when the last attack packet was sent.
+     * Enforces one packet per 50ms tick regardless of APS rate.
+     */
+    private int lastAttackTick = -1;
+
+    /** Whether the target entity changed since last tick. */
+    private boolean freshTarget = false;
+
+    /** Entity ID of current target for change detection. */
     private int lastTargetId = -1;
+
+    /** Timestamp of last target switch (for BackTrack sync). */
+    long lastTargetSwitchTime = 0L;
 
     public final ModeProperty mode;
     public final ModeProperty sort;
@@ -112,19 +139,37 @@ public class KillAura extends Module {
     public final ModeProperty debugLog;
 
     // -------------------------------------------------------
-    // Hit Select properties
+    // Mid Trade properties
     // -------------------------------------------------------
-    /**
-     * Mid Trade: only allows clicks when the target can actually take damage
-     * (hurtResistantTime == 0). Cancels clicks otherwise to avoid slowing
-     * yourself down with unnecessary hits, letting you move faster.
-     */
+
+    /** Enables the burst click engine. */
     public final BooleanProperty midTrade;
 
     /**
-     * Controls the maximum duration the module will prevent clicks after a hit.
-     * Higher values = move faster, lower average APS.
-     * 500ms = one full i-frame window. NOT ping dependent.
+     * Minimum attacks per second for the raw click generator.
+     * The generator fires at a random interval between 1000/maxAPS and 1000/minAPS ms.
+     * Even at high APS values, the burst/pause cycle keeps average CPS at ~7-8.
+     */
+    public final IntProperty minAPS;
+
+    /**
+     * Maximum attacks per second for the raw click generator.
+     * Higher maxAPS = denser clicks within each burst window.
+     */
+    public final IntProperty maxAPS;
+
+    /**
+     * Duration of each burst window in ms.
+     * Clicks are only allowed inside this window.
+     * Should be sized to fit 2-4 clicks at your target APS:
+     *   e.g. 200ms window at 15 APS = 200/67ms = ~3 clicks
+     */
+    public final IntProperty burstWindow;
+
+    /**
+     * Pause duration after each burst in ms.
+     * No clicks are sent during this phase.
+     * Controls average CPS: longer pause = lower average APS.
      */
     public final IntProperty midTradePause;
 
@@ -138,71 +183,126 @@ public class KillAura extends Module {
                 : 1000L / RandomUtil.nextLong(this.minCPS.getValue(), this.maxCPS.getValue());
     }
 
+    // -------------------------------------------------------
+    // Mid Trade — Burst Engine
+    // -------------------------------------------------------
+
     /**
-     * Burst click gate.
+     * Burst click gate — pure time-based, zero network dependency.
      *
-     * Pattern: 3-4 clicks at 125-140ms intervals, pause, repeat.
-     * Pause duration is configurable 0-500ms.
-     * 0 = disabled.
+     * State machine:
+     *   IDLE  → no target, resets cleanly on new engagement
+     *   BURST → APS-driven click attempts allowed inside burst window
+     *   PAUSE → all clicks blocked for exactly pauseDurationMs (wall clock only)
+     *
+     * Pause contract (from spec):
+     *   if (currentTime - lastBurstEnd < pauseDurationMs) → cancel click
+     *   No ping. No TPS. No latency scaling. Pure wall clock.
+     *
+     * Tick alignment:
+     *   Only one attack packet allowed per 50ms tick regardless of APS.
+     *   Prevents redundant hits and keeps server behavior consistent.
+     *
+     * Returns true to suppress this click attempt, false to allow it.
      */
     private boolean isHitSelectPaused() {
         if (this.target == null) return false;
         if (!this.midTrade.getValue()) return false;
 
-        int pauseMs = this.midTradePause.getValue();
-        if (pauseMs == 0) return false;
-
-        if (this.hitSelectFreshTarget) {
-            this.hitSelectFreshTarget = false;
-            this.midTradePauseUntil = 0L;
-            this.midTradeHitCount = 0;
-            // Calculate burst size from pause duration to maintain 8-9 CPS average
-            // burstSize = pauseMs / 15 → derived from target interval of 125ms average
-            this.burstSize = Math.max(2, this.midTradePause.getValue() / 15);
-            return false;
-        }
-
         long now = System.currentTimeMillis();
 
-        // Pause window
-        if (now < this.midTradePauseUntil) return true;
-
-        // Burst complete — open pause, notify BackTrack, recalculate burst size
-        if (this.midTradeHitCount >= this.burstSize) {
-            this.midTradePauseUntil = now + pauseMs;
-            this.midTradeHitCount = 0;
-            // Recalculate for next burst — keeps CPS stable across all pause values
-            this.burstSize = Math.max(2, pauseMs / 15);
-            BackTrack bt = (BackTrack) Myau.moduleManager.getModule(BackTrack.class);
-            if (bt != null && bt.isEnabled()) bt.onKillAuraBurstComplete();
-            return true;
-        }
-
-        // First hit of burst fires immediately
-        if (this.midTradeHitCount == 0) {
+        // Fresh target: reset to IDLE cleanly
+        if (this.freshTarget) {
+            this.freshTarget       = false;
+            this.burstPhase        = BurstPhase.IDLE;
+            this.burstWindowStart  = 0L;
+            this.lastBurstEnd      = 0L;
+            this.lastClickAttempt  = 0L;
+            this.lastAttackTick    = -1;
+            this.nextClickInterval = this.randomClickInterval();
             BackTrack bt = (BackTrack) Myau.moduleManager.getModule(BackTrack.class);
             if (bt != null && bt.isEnabled()) bt.onKillAuraResuming();
-            return false;
         }
 
-        // 110-120ms between each click = 8-9 CPS, compensates for event overhead
-        long interval = 110L + (long)(Math.random() * 10L);
-        if (now - this.lastHitTime < interval) return true;
+        switch (this.burstPhase) {
 
-        return false;
+            case IDLE:
+                // Open first burst immediately on engagement
+                this.burstPhase       = BurstPhase.BURST;
+                this.burstWindowStart = now;
+                this.lastClickAttempt = now - this.nextClickInterval; // fire first click now
+                return false;
+
+            case BURST: {
+                // ── Pause check (spec contract) ───────────────────────────
+                // Not applicable in BURST — but guard against stale state
+                // where lastBurstEnd was set without transitioning (shouldn't happen)
+
+                // ── Burst window expired → enter pause ────────────────────
+                if (now - this.burstWindowStart >= this.burstWindow.getValue()) {
+                    this.burstPhase  = BurstPhase.PAUSE;
+                    this.lastBurstEnd = now;
+                    BackTrack bt = (BackTrack) Myau.moduleManager.getModule(BackTrack.class);
+                    if (bt != null && bt.isEnabled()) bt.onKillAuraBurstComplete();
+                    return true;
+                }
+
+                // ── Tick alignment: one packet per 50ms tick ──────────────
+                int currentTick = mc.thePlayer != null ? mc.thePlayer.ticksExisted : -1;
+                if (currentTick != -1 && currentTick == this.lastAttackTick) return true;
+
+                // ── APS-based click interval gate ─────────────────────────
+                if (now - this.lastClickAttempt < this.nextClickInterval) return true;
+
+                // Attempt ready — will be consumed by performAttack
+                return false;
+            }
+
+            case PAUSE:
+                // ── Pure time-based pause (spec contract) ─────────────────
+                // if (currentTime - lastBurstEnd < pauseDurationMs) → cancel
+                if (now - this.lastBurstEnd < this.midTradePause.getValue()) return true;
+
+                // Pause expired → reopen burst window
+                this.burstPhase       = BurstPhase.BURST;
+                this.burstWindowStart = now;
+                this.lastClickAttempt = now - this.nextClickInterval; // fire first click immediately
+                this.nextClickInterval = this.randomClickInterval();
+                BackTrack bt = (BackTrack) Myau.moduleManager.getModule(BackTrack.class);
+                if (bt != null && bt.isEnabled()) bt.onKillAuraResuming();
+                return false;
+
+            default:
+                return false;
+        }
     }
 
+    /**
+     * Returns a randomized interval in ms between clicks.
+     * Derived strictly from minAPS/maxAPS:
+     *   intervalMin = 1000 / maxAPS
+     *   intervalMax = 1000 / minAPS
+     */
+    private long randomClickInterval() {
+        long lo = 1000L / Math.max(1, this.maxAPS.getValue());
+        long hi = 1000L / Math.max(1, this.minAPS.getValue());
+        if (lo >= hi) return lo;
+        return lo + (long)(Math.random() * (hi - lo));
+    }
+
+    /** Called after every confirmed attack packet is sent. */
     private void armHitSelect() {
-        this.lastHitTime = System.currentTimeMillis();
-        this.midTradeHitCount++;
+        long now = System.currentTimeMillis();
+        this.lastClickAttempt  = now;
+        this.nextClickInterval = this.randomClickInterval();
+        if (mc.thePlayer != null) this.lastAttackTick = mc.thePlayer.ticksExisted;
     }
 
     private void notifyTargetChanged(int newEntityId) {
         if (newEntityId != this.lastTargetId) {
             this.lastTargetSwitchTime = System.currentTimeMillis();
-            this.lastTargetId = newEntityId;
-            this.hitSelectFreshTarget = true;
-            // Sync BackTrack to the new target immediately
+            this.lastTargetId         = newEntityId;
+            this.freshTarget          = true;
             BackTrack bt = (BackTrack) Myau.moduleManager.getModule(BackTrack.class);
             if (bt != null && bt.isEnabled()) bt.syncTarget(newEntityId);
         }
@@ -450,8 +550,14 @@ public class KillAura extends Module {
         this.debugLog = new ModeProperty("debug-log", 0, new String[]{"NONE", "HEALTH"});
 
         // ── Mid Trade ─────────────────────────────────────────────────────────
-        this.midTrade = new BooleanProperty("mid-trade", false);
-        this.midTradePause = new IntProperty("mid-trade-pause", 300, 0, 500,
+        this.midTrade  = new BooleanProperty("mid-trade", false);
+        this.minAPS    = new IntProperty("min-aps", 12, 6, 20,
+                this.midTrade::getValue);
+        this.maxAPS    = new IntProperty("max-aps", 20, 10, 30,
+                this.midTrade::getValue);
+        this.burstWindow = new IntProperty("burst-window", 200, 100, 350,
+                this.midTrade::getValue);
+        this.midTradePause = new IntProperty("burst-pause", 300, 100, 600,
                 this.midTrade::getValue);
     }
 
@@ -1041,11 +1147,13 @@ public class KillAura extends Module {
         this.hitRegistered = false;
         this.attackDelayMS = 0L;
         this.blockTick = 0;
-        this.hitSelectFreshTarget = false;
-        this.lastHitTime = 0L;
-        this.midTradeHitCount = 0;
-        this.burstSize = 3;
-        this.midTradePauseUntil = 0L;
+        this.burstPhase        = BurstPhase.IDLE;
+        this.burstWindowStart  = 0L;
+        this.lastBurstEnd      = 0L;
+        this.lastClickAttempt  = 0L;
+        this.nextClickInterval = 0L;
+        this.lastAttackTick    = -1;
+        this.freshTarget       = false;
         this.lastTargetSwitchTime = 0L;
         this.lastTargetId = -1;
     }
@@ -1056,11 +1164,13 @@ public class KillAura extends Module {
         this.blockingState = false;
         this.isBlocking = false;
         this.fakeBlockState = false;
-        this.hitSelectFreshTarget = false;
-        this.lastHitTime = 0L;
-        this.midTradeHitCount = 0;
-        this.burstSize = 3;
-        this.midTradePauseUntil = 0L;
+        this.burstPhase        = BurstPhase.IDLE;
+        this.burstWindowStart  = 0L;
+        this.lastBurstEnd      = 0L;
+        this.lastClickAttempt  = 0L;
+        this.nextClickInterval = 0L;
+        this.lastAttackTick    = -1;
+        this.freshTarget       = false;
         this.lastTargetSwitchTime = 0L;
         this.lastTargetId = -1;
     }
@@ -1100,6 +1210,12 @@ public class KillAura extends Module {
                 if (autoBlockMaxCPS.getValue() > 10.0F && badCps) {
                     autoBlockMaxCPS.setValue(10.0F);
                 }
+            } else if (this.minAPS.getName().equals(value)) {
+                if (this.minAPS.getValue() > this.maxAPS.getValue())
+                    this.maxAPS.setValue(this.minAPS.getValue());
+            } else if (this.maxAPS.getName().equals(value)) {
+                if (this.minAPS.getValue() > this.maxAPS.getValue())
+                    this.minAPS.setValue(this.maxAPS.getValue());
             } else {
                 if (this.maxCPS.getName().equals(value) && this.minCPS.getValue() > this.maxCPS.getValue()) {
                     this.minCPS.setValue(this.maxCPS.getValue());
