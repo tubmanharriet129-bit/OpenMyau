@@ -156,7 +156,9 @@ public class KillAura extends Module {
             this.hitSelectFreshTarget = false;
             this.midTradePauseUntil = 0L;
             this.midTradeHitCount = 0;
-            this.burstSize = 3 + (int)(Math.random() * 2); // 3 or 4
+            // Calculate burst size from pause duration to maintain 8-9 CPS average
+            // burstSize = pauseMs / 15 → derived from target interval of 125ms average
+            this.burstSize = Math.max(2, this.midTradePause.getValue() / 15);
             return false;
         }
 
@@ -165,11 +167,12 @@ public class KillAura extends Module {
         // Pause window
         if (now < this.midTradePauseUntil) return true;
 
-        // Burst complete — open pause, notify BackTrack, pick new burst size
+        // Burst complete — open pause, notify BackTrack, recalculate burst size
         if (this.midTradeHitCount >= this.burstSize) {
             this.midTradePauseUntil = now + pauseMs;
             this.midTradeHitCount = 0;
-            this.burstSize = 3 + (int)(Math.random() * 2); // 3 or 4 for next burst
+            // Recalculate for next burst — keeps CPS stable across all pause values
+            this.burstSize = Math.max(2, pauseMs / 15);
             BackTrack bt = (BackTrack) Myau.moduleManager.getModule(BackTrack.class);
             if (bt != null && bt.isEnabled()) bt.onKillAuraBurstComplete();
             return true;
@@ -182,8 +185,8 @@ public class KillAura extends Module {
             return false;
         }
 
-        // 125-140ms between each click in the burst (7-8 CPS)
-        long interval = 125L + (long)(Math.random() * 15L);
+        // 110-120ms between each click = 8-9 CPS, compensates for event overhead
+        long interval = 110L + (long)(Math.random() * 10L);
         if (now - this.lastHitTime < interval) return true;
 
         return false;
@@ -510,7 +513,12 @@ public class KillAura extends Module {
         }
         if (this.isEnabled() && event.getType() == EventType.PRE) {
             if (this.attackDelayMS > 0L) {
-                this.attackDelayMS -= 50L;
+                if (this.midTrade.getValue()) {
+                    // midTrade owns all timing — never let CPS debt stall attacks
+                    this.attackDelayMS = 0L;
+                } else {
+                    this.attackDelayMS -= 50L;
+                }
             }
             boolean attack = this.target != null && this.isAttackAllowed();
             boolean block = attack && this.canAutoBlock();
