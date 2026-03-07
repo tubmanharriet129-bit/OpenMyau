@@ -28,36 +28,51 @@ import java.util.ArrayDeque;
 import java.util.Deque;
 
 /**
- * BackTrack — smooth interpolated XZ desync.
+ * BackTrack — adaptive smooth XZ desync, no restore cycle.
  *
- * No packets are ever cancelled or buffered.
- * All position packets process normally — Y is always live.
+ * Core design:
+ *   Real XZ is tracked separately from the override. The entity's posX/Z
+ *   is permanently held at the smooth lerped override value. No restore
+ *   cycle means no flicker — the entity visually glides to the delayed
+ *   position and stays there.
  *
- * Each tick:
- *   1. Restore real XZ from last tick's override.
- *   2. Record the entity's real XZ into a snapshot ring buffer.
- *   3. Find the snapshot from delayMs ago.
- *   4. Smoothly interpolate entity XZ toward that snapshot using lerpFactor.
- *   5. Update bounding box to match.
- *
- * The lerp eliminates the hard per-tick snap that caused jitter.
- * At lerpFactor=0.3 the entity glides smoothly to the delayed position
- * rather than teleporting there instantly each frame.
- *
- * Y is never touched — entities stay correctly grounded at all times.
+ * Improvements over previous version:
+ *   1. Best-snapshot selection — picks the oldest snapshot still within
+ *      attack range rather than blindly using delayMs. This maximises
+ *      desync while guaranteeing every attack registers.
+ *   2. Adaptive lerp — speed scales with the distance between override
+ *      and target snapshot. Large gaps converge faster, small gaps stay
+ *      smooth. Prevents rubber-band on fast-moving targets.
+ *   3. Real position isolation — we record realX/Z BEFORE applyOverride
+ *      so the snapshot buffer always contains server-authoritative values,
+ *      not our overridden ones.
+ *   4. Smooth release — when snapping to real (burst end / i-frame expiry),
+ *      we lerp toward real rather than teleporting instantly.
+ *   5. Dead-zone threshold — overrides below 0.001 blocks are skipped
+ *      to avoid micro-jitter from floating point noise.
  */
 public class BackTrack extends Module {
     private static final Minecraft mc = Minecraft.getMinecraft();
 
     // ── Settings ──────────────────────────────────────────────────────────
 
-    /** How far back in ms to target for XZ desync. Max ~150ms for Hypixel. */
-    public final IntProperty delayMs = new IntProperty("hold-time", 100, 20, 150);
+    /**
+     * How far back in ms to look for the best snapshot.
+     * Higher = more desync but more visual lag. Max ~150ms for Hypixel.
+     */
+    public final IntProperty delay = new IntProperty("delay", 100, 20, 150);
 
     public final FloatProperty minDistance = new FloatProperty("min-dist", 1.0f, 0.5f, 4.0f);
     public final FloatProperty maxDistance = new FloatProperty("max-dist", 4.0f, 1.0f, 6.0f);
 
-    public final IntProperty iFrameThreshold = new IntProperty("iframe-threshold", 2, 1, 10);
+    /**
+     * Release timing — when hurtResistantTime drops to this tick count,
+     * the override snaps to real so KillAura can fire at the true position
+     * as i-frames expire. Lower = more aggressive double-hit timing.
+     * 1 = release at last possible moment. 10 = release immediately on damage.
+     */
+    public final IntProperty releaseTiming = new IntProperty("release-timing", 2, 1, 10);
+
     public final BooleanProperty jumpPeak = new BooleanProperty("jump-peak", true);
 
     public final ModeProperty showPosition = new ModeProperty("show-position", 1,
@@ -67,61 +82,55 @@ public class BackTrack extends Module {
 
     private static final class Snapshot {
         final double x, z;
-        final long   timestamp;
-        Snapshot(double x, double z, long ts) { this.x = x; this.z = z; this.timestamp = ts; }
+        final long   ts;
+        Snapshot(double x, double z, long ts) { this.x = x; this.z = z; this.ts = ts; }
     }
+
+    // ── Constants ─────────────────────────────────────────────────────────
+
+    /** Base lerp factor for smooth movement. */
+    private static final double LERP_BASE = 0.18;
+
+    /** Dead-zone — ignore overrides smaller than this to prevent micro-jitter. */
+    private static final double DEAD_ZONE = 0.001;
+
+    /** How fast to lerp back to real during a smooth release. */
+    private static final double RELEASE_LERP = 0.35;
 
     // ── State ─────────────────────────────────────────────────────────────
 
     private final Deque<Snapshot> snapshots = new ArrayDeque<>();
 
-    /** Lerp factor per tick — how quickly the override position tracks the snapshot.
-     *  0.25 = smooth glide; 1.0 = instant snap (causes jitter). */
-    private static final double LERP = 0.25;
-
-    /** Current interpolated override XZ. Starts at real position. */
+    /** Current smooth override XZ — never restored, permanently applied. */
     private double overrideX, overrideZ;
 
-    /** Real XZ saved before we applied the override this tick. */
+    /** Server-authoritative real XZ read this tick before any override. */
     private double realX, realZ;
-    private double realPrevX, realPrevZ;
-    private double realLastX, realLastZ;
 
-    /** Whether we currently have an override applied. */
+    /** True while override is applied. */
     private boolean active = false;
 
-    /** Whether the first attack has armed the module. */
+    /** True once S19 confirms first hit. */
     private boolean engaged = false;
 
-    /**
-     * Entity ID that KillAura is currently attacking but hasn't confirmed a
-     * hit on yet. BackTrack only activates (engaged=true) once S19 opcode 2
-     * arrives for this entity — confirming actual damage landed.
-     */
+    /** Entity ID awaiting S19 hit confirmation. */
     private int pendingTargetId = -1;
 
-    /** Entity ID being tracked. */
+    /** Entity ID currently being overridden. */
     private int targetId = -1;
 
+    /** True when burst ends — triggers smooth release to real position. */
+    private boolean releasing = false;
+
     /** Jump peak tracking. */
-    private double prevTargetY  = 0.0;
-    private double prevTargetDy = 0.0;
+    private double  prevTargetY  = 0.0;
+    private double  prevTargetDy = 0.0;
     private boolean prevYTracked = false;
 
-    /** Whether double-hit snap is requested this tick. */
-    private boolean snapRequested = false;
+    public BackTrack() { super("BackTrack", false); }
 
-    public BackTrack() {
-        super("BackTrack", false);
-    }
-
-    // ── Lifecycle ─────────────────────────────────────────────────────────
-
-    @Override
-    public void onEnabled()  { this.resetState(); }
-
-    @Override
-    public void onDisabled() { this.restorePosition(); this.resetState(); }
+    @Override public void onEnabled()  { this.resetState(); }
+    @Override public void onDisabled() { this.resetState(); }
 
     // ── Main tick ─────────────────────────────────────────────────────────
 
@@ -129,10 +138,6 @@ public class BackTrack extends Module {
     public void onTick(TickEvent event) {
         if (!this.isEnabled() || mc.thePlayer == null || mc.theWorld == null) return;
         if (event.getType() != EventType.PRE) return;
-
-        // Always restore real position first so this tick starts clean
-        this.restorePosition();
-
         if (!this.engaged) return;
 
         EntityLivingBase target = this.getCurrentTarget();
@@ -145,14 +150,22 @@ public class BackTrack extends Module {
 
         long now = System.currentTimeMillis();
 
-        // Record real XZ snapshot
-        this.snapshots.addLast(new Snapshot(target.posX, target.posZ, now));
+        // Read real XZ from the entity — this is the server-authoritative value
+        // because we accumulate our override on top of it, making posX drift.
+        // We isolate the real value by un-applying our current override delta.
+        if (this.active) {
+            this.realX = target.posX + (this.realX - this.overrideX);
+            this.realZ = target.posZ + (this.realZ - this.overrideZ);
+        } else {
+            this.realX = target.posX;
+            this.realZ = target.posZ;
+        }
+
+        // Record server-authoritative snapshot
+        this.snapshots.addLast(new Snapshot(this.realX, this.realZ, now));
         while (this.snapshots.size() > 128) this.snapshots.pollFirst();
 
-        // Double-hit: snap to real position and clear override
-        boolean iframeSnap = target.hurtResistantTime > 0
-                && target.hurtResistantTime <= this.iFrameThreshold.getValue();
-
+        // Jump peak detection
         boolean peakSnap = false;
         if (this.jumpPeak.getValue() && this.prevYTracked) {
             double curDy = target.posY - this.prevTargetY;
@@ -160,75 +173,88 @@ public class BackTrack extends Module {
         }
         this.updatePrevY(target);
 
-        if (iframeSnap || peakSnap || this.snapRequested) {
-            this.snapRequested = false;
-            this.overrideX = target.posX;
-            this.overrideZ = target.posZ;
-            this.snapshots.clear(); // rearm
-            this.active = false;
+        // i-frame release timing
+        boolean iframeSnap = target.hurtResistantTime > 0
+                && target.hurtResistantTime <= this.releaseTiming.getValue();
+
+        // Any release trigger: smoothly return to real position
+        if (iframeSnap || peakSnap || this.releasing) {
+            this.releasing = false;
+
+            // Smooth release — lerp override toward real
+            this.overrideX += (this.realX - this.overrideX) * RELEASE_LERP;
+            this.overrideZ += (this.realZ - this.overrideZ) * RELEASE_LERP;
+
+            // Once close enough, snap exactly to real and clear buffer
+            double releaseGap = Math.sqrt(
+                    Math.pow(this.overrideX - this.realX, 2)
+                  + Math.pow(this.overrideZ - this.realZ, 2));
+            if (releaseGap < 0.05) {
+                this.overrideX = this.realX;
+                this.overrideZ = this.realZ;
+                this.snapshots.clear();
+            }
+
+            this.applyOverride(target, this.overrideX, this.overrideZ);
+            this.active = true;
             return;
         }
 
-        // Find the snapshot closest to delayMs ago
-        Snapshot target_snapshot = null;
+        // Best-snapshot selection:
+        // Find the oldest snapshot still within attack range.
+        // This maximises desync while guaranteeing every hit registers.
+        Snapshot best = null;
+        double attackRange = this.maxDistance.getValue();
         for (Snapshot s : this.snapshots) {
-            if (now - s.timestamp >= this.delayMs.getValue()) target_snapshot = s;
-            else break;
+            if (now - s.ts > this.delay.getValue()) {
+                // Check if this historical position is still in attack range
+                double hx = s.x - mc.thePlayer.posX;
+                double hz = s.z - mc.thePlayer.posZ;
+                double hdist = Math.sqrt(hx * hx + hz * hz);
+                if (hdist <= attackRange) best = s;
+            } else {
+                break;
+            }
         }
 
-        if (target_snapshot == null) {
-            // Not enough history yet
-            this.overrideX = target.posX;
-            this.overrideZ = target.posZ;
+        if (best == null) {
+            // Not enough history or no reachable snapshot — stay at real
+            this.overrideX = this.realX;
+            this.overrideZ = this.realZ;
             this.active = false;
             return;
         }
 
-        // Smoothly interpolate override XZ toward the delayed snapshot
-        // Lerp: overrideX += (targetX - overrideX) * LERP
-        this.overrideX += (target_snapshot.x - this.overrideX) * LERP;
-        this.overrideZ += (target_snapshot.z - this.overrideZ) * LERP;
+        // Adaptive lerp — converges faster when the gap is large,
+        // stays silky smooth when already close to the snapshot.
+        double gap = Math.sqrt(
+                Math.pow(best.x - this.overrideX, 2)
+              + Math.pow(best.z - this.overrideZ, 2));
+        double lerpFactor = LERP_BASE + Math.min(gap * 0.08, 0.25);
 
-        // Save real position
-        this.realX     = target.posX;     this.realZ     = target.posZ;
-        this.realPrevX = target.prevPosX; this.realPrevZ = target.prevPosZ;
-        this.realLastX = target.lastTickPosX; this.realLastZ = target.lastTickPosZ;
+        this.overrideX += (best.x - this.overrideX) * lerpFactor;
+        this.overrideZ += (best.z - this.overrideZ) * lerpFactor;
 
-        // Apply smooth override — Y untouched
-        double dx = this.overrideX - target.posX;
-        double dz = this.overrideZ - target.posZ;
-
-        target.posX          = this.overrideX;
-        target.posZ          = this.overrideZ;
-        // Interpolate prev/lastTick positions too so rendering is smooth
-        target.prevPosX      = this.realPrevX + dx;
-        target.prevPosZ      = this.realPrevZ + dz;
-        target.lastTickPosX  = this.realLastX + dx;
-        target.lastTickPosZ  = this.realLastZ + dz;
-
-        // Shift bounding box to match
-        target.setEntityBoundingBox(target.getEntityBoundingBox().offset(dx, 0.0, dz));
-
+        this.applyOverride(target, this.overrideX, this.overrideZ);
         this.active = true;
     }
 
-    // ── Restore ───────────────────────────────────────────────────────────
+    /**
+     * Applies the XZ override to the entity.
+     * Shifts posX/Z, prevPosX/Z, and lastTickPosX/Z by the same delta
+     * so Minecraft's render interpolation sees a consistent offset —
+     * preventing model stretching between frames.
+     * Y is never touched.
+     */
+    private void applyOverride(EntityLivingBase e, double ox, double oz) {
+        double dx = ox - e.posX;
+        double dz = oz - e.posZ;
+        if (Math.abs(dx) < DEAD_ZONE && Math.abs(dz) < DEAD_ZONE) return;
 
-    private void restorePosition() {
-        if (!this.active) return;
-        EntityLivingBase target = this.getCurrentTarget();
-        if (target == null) { this.active = false; return; }
-
-        double dx = this.realX - target.posX;
-        double dz = this.realZ - target.posZ;
-
-        target.posX         = this.realX;     target.posZ         = this.realZ;
-        target.prevPosX     = this.realPrevX; target.prevPosZ     = this.realPrevZ;
-        target.lastTickPosX = this.realLastX; target.lastTickPosZ = this.realLastZ;
-
-        target.setEntityBoundingBox(target.getEntityBoundingBox().offset(dx, 0.0, dz));
-
-        this.active = false;
+        e.posX         += dx; e.posZ         += dz;
+        e.prevPosX     += dx; e.prevPosZ     += dz;
+        e.lastTickPosX += dx; e.lastTickPosZ += dz;
+        e.setEntityBoundingBox(e.getEntityBoundingBox().offset(dx, 0.0, dz));
     }
 
     // ── Packet handler ────────────────────────────────────────────────────
@@ -237,26 +263,22 @@ public class BackTrack extends Module {
     public void onPacket(PacketEvent event) {
         if (!this.isEnabled() || mc.thePlayer == null) return;
 
-        // S08 teleport (us): hard reset
         if (event.getType() == EventType.RECEIVE
                 && event.getPacket() instanceof S08PacketPlayerPosLook) {
-            this.restorePosition();
             this.resetState();
             return;
         }
 
-        // S19 opcode 2 on pending target: confirmed hit — now engage
+        // S19 opcode 2: confirmed hit — engage
         if (event.getType() == EventType.RECEIVE
                 && event.getPacket() instanceof S19PacketEntityStatus) {
             S19PacketEntityStatus s19 = (S19PacketEntityStatus) event.getPacket();
-            if (s19.getOpCode() == 2 && mc.theWorld != null
-                    && this.pendingTargetId != -1) {
+            if (s19.getOpCode() == 2 && mc.theWorld != null && this.pendingTargetId != -1) {
                 Entity hit = s19.getEntity(mc.theWorld);
                 if (hit != null && hit.getEntityId() == this.pendingTargetId) {
-                    // Hit confirmed — engage BackTrack on this target
                     if (this.targetId != -1 && this.targetId != this.pendingTargetId) {
-                        this.restorePosition();
                         this.snapshots.clear();
+                        this.active = false;
                     }
                     this.targetId     = this.pendingTargetId;
                     this.engaged      = true;
@@ -268,8 +290,7 @@ public class BackTrack extends Module {
             return;
         }
 
-        // Outbound C02 attack: register pending target, do NOT engage yet
-        // BackTrack stays inactive until S19 confirms the hit actually landed
+        // C02 attack: register pending target
         if (event.getType() == EventType.SEND
                 && event.getPacket() instanceof C02PacketUseEntity) {
             C02PacketUseEntity use = (C02PacketUseEntity) event.getPacket();
@@ -277,10 +298,8 @@ public class BackTrack extends Module {
             if (mc.theWorld == null) return;
             Entity entity = use.getEntityFromWorld(mc.theWorld);
             if (!(entity instanceof EntityLivingBase)) return;
-            double dist = mc.thePlayer.getDistanceToEntity(entity);
-            if (dist < this.minDistance.getValue() || dist > this.maxDistance.getValue()) return;
-
-            // Track who we're attacking — engagement waits for S19 confirmation
+            double d = mc.thePlayer.getDistanceToEntity(entity);
+            if (d < this.minDistance.getValue() || d > this.maxDistance.getValue()) return;
             this.pendingTargetId = entity.getEntityId();
         }
     }
@@ -289,24 +308,25 @@ public class BackTrack extends Module {
 
     public void onKillAuraBurstComplete() {
         if (!this.isEnabled()) return;
-        this.snapRequested = true; // snap to real on next tick
+        this.releasing = true; // smooth lerp back to real during pause
     }
 
     public void onKillAuraResuming() {
         if (!this.isEnabled()) return;
-        this.snapshots.clear(); // fresh snapshot window for next burst
+        this.releasing = false;
+        this.snapshots.clear(); // fresh window for next burst
     }
 
     public void syncTarget(int entityId) {
         if (!this.isEnabled()) return;
         if (this.targetId != entityId) {
-            this.restorePosition();
             this.snapshots.clear();
             this.active = false;
         }
-        this.pendingTargetId = entityId; // wait for S19 confirmation
+        this.pendingTargetId = entityId;
         this.targetId        = entityId;
-        this.engaged         = true;     // KillAura already confirmed a hit
+        this.engaged         = true;
+        this.releasing       = false;
         this.prevYTracked    = false;
         EntityLivingBase e = this.getCurrentTarget();
         if (e != null) { this.overrideX = e.posX; this.overrideZ = e.posZ; }
@@ -334,10 +354,10 @@ public class BackTrack extends Module {
         this.snapshots.clear();
         this.active          = false;
         this.engaged         = false;
+        this.releasing       = false;
         this.targetId        = -1;
         this.pendingTargetId = -1;
         this.prevYTracked    = false;
-        this.snapRequested   = false;
     }
 
     // ── Render ────────────────────────────────────────────────────────────
@@ -381,6 +401,6 @@ public class BackTrack extends Module {
 
     @Override
     public String[] getSuffix() {
-        return new String[]{String.format("%dms", this.delayMs.getValue())};
+        return new String[]{String.format("%dms", this.delay.getValue())};
     }
 }
